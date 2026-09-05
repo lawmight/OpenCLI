@@ -14,10 +14,46 @@ function runExtract(html, limit = 10, url = 'https://www.facebook.com/') {
   return Function('window', 'document', `return ${__test__.buildFeedExtractScript(limit)};`)(dom.window, dom.window.document);
 }
 
-function createPage(payload) {
+function runSurface(html, url = 'https://www.facebook.com/') {
+  const dom = new JSDOM(html, { url });
+  return Function('window', 'document', `return ${__test__.buildSurfaceCheckScript()};`)(dom.window, dom.window.document);
+}
+
+function createPage(payload, options = {}) {
+  const surface = {
+    ready: true,
+    feedFound: true,
+    messengerDom: false,
+    isMessagesRoute: false,
+    onHome: true,
+    path: '/',
+    hash: '',
+    href: 'https://www.facebook.com/',
+    ...options.surface,
+  };
+  const prepare = { status: 'ready', feedFound: true, path: '/', ...options.prepare };
+
   return {
     goto: vi.fn().mockResolvedValue(undefined),
-    evaluate: vi.fn().mockResolvedValue(payload),
+    wait: vi.fn().mockResolvedValue(undefined),
+    tabs: vi.fn().mockResolvedValue(options.tabs ?? []),
+    selectTab: vi.fn().mockResolvedValue(undefined),
+    evaluate: vi.fn().mockImplementation((script) => {
+      const source = String(script);
+      if (source.includes('primaryContainers') || source.includes('wrong_surface') || source.includes('extractPost')) {
+        return Promise.resolve(payload);
+      }
+      if (source.includes('isMessagesRoute') && source.includes('feedFound')) {
+        return Promise.resolve(surface);
+      }
+      if (source.includes('redirecting') || source.includes('Close chat')) {
+        return Promise.resolve(prepare);
+      }
+      if (source.includes('scrollHeight') || source.includes('scrollTop')) {
+        return Promise.resolve(0);
+      }
+      return Promise.resolve(payload);
+    }),
   };
 }
 
@@ -159,6 +195,8 @@ describe('facebook feed', () => {
       comments: '-',
       shares: '-',
     }]);
+    expect(page.goto).toHaveBeenCalled();
+    expect(String(page.goto.mock.calls[0][0])).toContain('_opencli_feed=');
   });
 
   it('keeps scrolling when raw article markers reach the limit but valid rows do not (#2195)', async () => {
@@ -441,8 +479,71 @@ describe('facebook feed', () => {
       </main>
     `, 5);
 
-    expect(payload.status).toBe('no_rows');
+    expect(payload.status).toBe('no_feed');
     expect(payload.rows).toEqual([]);
+  });
+
+  it('refuses messenger routes before extraction', () => {
+    const payload = runExtract(`
+      <main role="main">
+        <div role="article">
+          <div dir="auto">Message sent February 26, 2026</div>
+          <div dir="auto">Enter</div>
+        </div>
+      </main>
+    `, 5, 'https://www.facebook.com/messages/t/123');
+
+    expect(payload.status).toBe('wrong_surface');
+    expect(payload.rows).toEqual([]);
+  });
+
+  it('detects messenger-only home surfaces without a feed landmark', () => {
+    const payload = runSurface(`
+      <main role="main">
+        <aside aria-label="Messenger" data-pagelet="ChatTab">
+          <a href="https://www.facebook.com/messages/t/123">Teiki Travels</a>
+        </aside>
+      </main>
+    `);
+
+    expect(payload.ready).toBe(false);
+    expect(payload.messengerDom).toBe(true);
+    expect(payload.feedFound).toBe(false);
+  });
+
+  it('selects a non-messages facebook tab before navigating home', async () => {
+    const page = {
+      goto: vi.fn().mockResolvedValue(undefined),
+      wait: vi.fn().mockResolvedValue(undefined),
+      tabs: vi.fn().mockResolvedValue([
+        { index: 0, page: 'messages-tab', url: 'https://www.facebook.com/messages/t/123', title: 'Messenger' },
+        { index: 1, page: 'home-tab', url: 'https://www.facebook.com/', title: 'Facebook' },
+      ]),
+      selectTab: vi.fn().mockResolvedValue(undefined),
+      evaluate: vi.fn().mockResolvedValue({ ready: true, feedFound: true, messengerDom: false, isMessagesRoute: false, path: '/' }),
+    };
+
+    await __test__.ensureNewsFeedSurface(page);
+    expect(page.selectTab).toHaveBeenCalledWith('home-tab');
+    expect(page.goto).toHaveBeenCalled();
+  });
+
+  it('fails fast when the news-feed surface never becomes ready', async () => {
+    const page = createPage({ status: 'ok', rows: [] }, {
+      surface: { ready: false, feedFound: false, messengerDom: true, isMessagesRoute: false, path: '/' },
+    });
+
+    await expect(__test__.command.func(page, { limit: 1 }))
+      .rejects.toThrow(/news-feed surface did not render/);
+  });
+
+  it('fails fast when the active tab is a Messenger route', async () => {
+    const page = createPage({ status: 'ok', rows: [] }, {
+      surface: { ready: false, feedFound: false, messengerDom: true, isMessagesRoute: true, path: '/messages/t/123' },
+    });
+
+    await expect(__test__.command.func(page, { limit: 1 }))
+      .rejects.toThrow(/Messenger\/messages tab/);
   });
 
   it('maps messenger-only extraction payloads to a typed bleed error', async () => {
@@ -458,5 +559,24 @@ describe('facebook feed', () => {
       .rejects.toBeInstanceOf(CommandExecutionError);
     await expect(__test__.command.func(page, { limit: 2 }))
       .rejects.toThrow(/Messenger\/chat UI/);
+  });
+
+  it('filters messenger bleed rows but keeps valid feed rows when mixed', async () => {
+    const page = createPage({
+      status: 'ok',
+      rows: [
+        { index: 1, author: '', content: 'Message sent February 26, 2026 Enter', likes: '-', comments: '-', shares: '-' },
+        { index: 2, author: 'Real Poster', content: 'Genuine feed post body', likes: '3', comments: '-', shares: '-' },
+      ],
+    });
+
+    await expect(__test__.command.func(page, { limit: 2 })).resolves.toEqual([{
+      index: 2,
+      author: 'Real Poster',
+      content: 'Genuine feed post body',
+      likes: '3',
+      comments: '-',
+      shares: '-',
+    }]);
   });
 });

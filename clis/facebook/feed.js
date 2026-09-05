@@ -3,6 +3,7 @@ import { cli, Strategy } from '@jackwener/opencli/registry';
 
 const FACEBOOK_HOME = 'https://www.facebook.com/';
 const MAX_LIMIT = 50;
+const FEED_SURFACE_ATTEMPTS = 4;
 
 function requireLimit(value) {
   const n = Number(value);
@@ -17,6 +18,113 @@ function unwrapBrowserResult(value) {
     return value.data;
   }
   return value;
+}
+
+function feedNavigationUrl() {
+  return `${FACEBOOK_HOME}?_opencli_feed=${Date.now()}`;
+}
+
+function rowLooksLikeMessengerBleed(row) {
+  if (!row || row.author) return false;
+  if (row.likes !== '-' || row.comments !== '-' || row.shares !== '-') return false;
+  const content = String(row.content || '').trim();
+  if (!content) return false;
+  if (/Message sent\b/i.test(content)
+    || /\bEnter\b/.test(content)
+    || /messages\/t\//i.test(content)
+    || /\b(Active now|Seen|Delivered|Typing\.{3})\b/i.test(content)) {
+    return true;
+  }
+  // Top-level feed posts should carry an author or engagement metrics. Authorless
+  // metric-less rows are extraction garbage, commonly Messenger/thread bleed.
+  return true;
+}
+
+function buildSurfaceCheckScript() {
+  return `(() => {
+    function clean(value) {
+      return String(value || '').replace(/\\s+/g, ' ').trim();
+    }
+    const path = window.location && window.location.pathname ? window.location.pathname : '';
+    const hash = window.location && window.location.hash ? window.location.hash : '';
+    const href = window.location && window.location.href ? window.location.href : '';
+    const isMessagesRoute = /^\\/messages(\\/|$)/.test(path)
+      || /\\/messages\\//i.test(hash)
+      || /\\/messages\\//i.test(href);
+    const feed = document.querySelector('[role="main"] [role="feed"]')
+      || document.querySelector('[role="feed"]');
+    const messengerDom = Boolean(
+      document.querySelector('[aria-label="Messenger"], [aria-label="Chats"], [data-pagelet*="Chat"]')
+      || document.querySelector('a[href*="/messages/t/"], a[href*="/messages/e2ee/"]'),
+    );
+    const onHome = path === '' || path === '/';
+    const ready = !isMessagesRoute && Boolean(feed);
+    return {
+      ready,
+      isMessagesRoute,
+      messengerDom,
+      feedFound: Boolean(feed),
+      onHome,
+      path,
+      hash,
+      href: clean(href).substring(0, 200),
+    };
+  })()`;
+}
+
+async function readFeedSurface(page) {
+  return unwrapBrowserResult(await page.evaluate(buildSurfaceCheckScript()));
+}
+
+async function selectNonMessengerFacebookTab(page) {
+  if (typeof page.tabs !== 'function' || typeof page.selectTab !== 'function') return false;
+  try {
+    const tabs = await page.tabs();
+    if (!Array.isArray(tabs) || tabs.length === 0) return false;
+    const candidate = tabs.find((tab) => {
+      const url = String(tab?.url || '');
+      return /(^|\.)facebook\.com/i.test(url) && !/\/messages(\/|$)/i.test(url);
+    });
+    if (!candidate?.page) return false;
+    await page.selectTab(candidate.page);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureNewsFeedSurface(page) {
+  await selectNonMessengerFacebookTab(page);
+
+  let lastSurface = null;
+  for (let attempt = 0; attempt < FEED_SURFACE_ATTEMPTS; attempt += 1) {
+    try {
+      await page.goto(feedNavigationUrl(), { settleMs: attempt === 0 ? 4000 : 5000 });
+    } catch (err) {
+      throw new CommandExecutionError(
+        `Failed to navigate to facebook feed: ${err instanceof Error ? err.message : err}`,
+        'Check that facebook.com is reachable and the browser extension is connected.',
+      );
+    }
+
+    try {
+      const prepared = unwrapBrowserResult(await page.evaluate(buildPrepareFeedScript()));
+      if (prepared && prepared.status === 'redirecting') {
+        await page.goto(feedNavigationUrl(), { settleMs: 5000 });
+      }
+    } catch {
+      // Preparation is best-effort; surface checks own final classification.
+    }
+
+    lastSurface = await readFeedSurface(page);
+    if (lastSurface?.ready) return lastSurface;
+
+    if (typeof page.wait === 'function') {
+      await page.wait(1);
+    }
+  }
+
+  return lastSurface;
 }
 
 function buildPrepareFeedScript() {
@@ -121,11 +229,42 @@ function buildFeedExtractScript(limit) {
     }
 
     function feedRoot() {
+      const path = window.location && window.location.pathname ? window.location.pathname : '';
+      const onHome = path === '' || path === '/';
       const scoped = document.querySelector('[role="main"] [role="feed"]')
         || document.querySelector('[role="feed"]');
       if (scoped) return scoped;
+      const messengerDom = Boolean(
+        document.querySelector('[aria-label="Messenger"], [aria-label="Chats"], [data-pagelet*="Chat"]')
+        || document.querySelector('a[href*="/messages/t/"], a[href*="/messages/e2ee/"]'),
+      );
+      // On facebook.com home with Messenger chrome visible, never fall back to
+      // role=main — thread previews and chat bubbles live there.
+      if (onHome && messengerDom) return null;
       const main = document.querySelector('[role="main"]');
       return main || document.body;
+    }
+
+    function currentSurface() {
+      const path = window.location && window.location.pathname ? window.location.pathname : '';
+      const hash = window.location && window.location.hash ? window.location.hash : '';
+      const href = window.location && window.location.href ? window.location.href : '';
+      const isMessagesRoute = /^\\/messages(\\/|$)/.test(path)
+        || /\\/messages\\//i.test(hash)
+        || /\\/messages\\//i.test(href);
+      const feed = document.querySelector('[role="main"] [role="feed"]')
+        || document.querySelector('[role="feed"]');
+      const messengerDom = Boolean(
+        document.querySelector('[aria-label="Messenger"], [aria-label="Chats"], [data-pagelet*="Chat"]')
+        || document.querySelector('a[href*="/messages/t/"], a[href*="/messages/e2ee/"]'),
+      );
+      return {
+        isMessagesRoute,
+        feedFound: Boolean(feed),
+        messengerDom,
+        ready: !isMessagesRoute && Boolean(feed),
+        path,
+      };
     }
 
     function isInsideMessenger(node) {
@@ -163,6 +302,7 @@ function buildFeedExtractScript(limit) {
 
     function withinFeedScope(node) {
       const root = feedRoot();
+      if (!root) return false;
       return root.contains(node) && !isInsideMessenger(node) && !isMessengerContainer(node);
     }
 
@@ -236,6 +376,7 @@ function buildFeedExtractScript(limit) {
         if (isSuggestionOrChrome(text) || isSponsored(text)) return false;
         if (isActionText(text) || isMetricText(text) || isTimestampText(text)) return false;
         if (isDecoyText(text) || isReelsOrCarouselChrome(text)) return false;
+        if (isMessengerOrChatText(text)) return false;
         if (/^(See more|查看更多|更多)$/i.test(text)) return false;
         return true;
       });
@@ -277,6 +418,7 @@ function buildFeedExtractScript(limit) {
 
     function primaryContainers() {
       const root = feedRoot();
+      if (!root) return [];
       return Array.from(root.querySelectorAll('[role="article"]'))
         .filter((el) => {
           if (!withinFeedScope(el)) return false;
@@ -297,6 +439,7 @@ function buildFeedExtractScript(limit) {
       // Post menus only — NOT "Actions for this comment", so the anchor set,
       // countMenus, and loadFeedPosts all key on the same thing (#2089).
       const root = feedRoot();
+      if (!root) return [];
       return Array.from(root.querySelectorAll('[aria-label]'))
         .filter((el) => isPostActionLabel(labelOf(el)) && withinFeedScope(el));
     }
@@ -381,6 +524,14 @@ function buildFeedExtractScript(limit) {
 
     if (isAuthPage()) return { status: 'auth', rows: [], diagnostics: {} };
 
+    const surface = currentSurface();
+    if (surface.isMessagesRoute) {
+      return { status: 'wrong_surface', rows: [], diagnostics: { surface } };
+    }
+    if (!surface.feedFound && surface.messengerDom) {
+      return { status: 'no_feed', rows: [], diagnostics: { surface } };
+    }
+
     const primary = primaryContainers();
     const actionAnchored = actionAnchoredContainers();
     const combined = dedupe([...primary, ...actionAnchored, ...fallbackContainers()]);
@@ -401,6 +552,7 @@ function buildFeedExtractScript(limit) {
         fallbackActionCount: document.querySelectorAll('[role="main"] [aria-label="Like"], [role="main"] [aria-label="赞"], [role="main"] [aria-label="Comment"], [role="main"] [aria-label="评论"]').length,
         mainTextLength: textOf(document.querySelector('[role="main"]')).length,
         feedFound: !!document.querySelector('[role="main"] [role="feed"], [role="feed"]'),
+        surface,
       },
     };
   })()`;
@@ -459,22 +611,19 @@ async function loadFeedPosts(page, limit) {
 
 async function getFacebookFeed(page, kwargs) {
   const limit = requireLimit(kwargs.limit ?? 10);
-  try {
-    await page.goto(FACEBOOK_HOME, { settleMs: 4000 });
-  } catch (err) {
-    throw new CommandExecutionError(
-      `Failed to navigate to facebook feed: ${err instanceof Error ? err.message : err}`,
-      'Check that facebook.com is reachable and the browser extension is connected.',
-    );
-  }
 
-  try {
-    const prepared = unwrapBrowserResult(await page.evaluate(buildPrepareFeedScript()));
-    if (prepared && prepared.status === 'redirecting') {
-      await page.goto(FACEBOOK_HOME, { settleMs: 4000 });
+  const surface = await ensureNewsFeedSurface(page);
+  if (!surface?.ready) {
+    if (surface?.isMessagesRoute) {
+      throw new CommandExecutionError(
+        'facebook feed is running against a Messenger/messages tab instead of the news feed',
+        'Switch Chrome to https://www.facebook.com/ (home news feed) or close the Messenger tab, then retry `opencli facebook feed`.',
+      );
     }
-  } catch {
-    // Preparation is best-effort; extraction still owns final error classification.
+    throw new CommandExecutionError(
+      'facebook feed news-feed surface did not render',
+      `Surface diagnostics: path=${surface?.path || '?'}, feedFound=${surface?.feedFound ? 'yes' : 'no'}, messengerDom=${surface?.messengerDom ? 'yes' : 'no'}. Close Messenger and retry.`,
+    );
   }
 
   await loadFeedPosts(page, limit);
@@ -497,15 +646,30 @@ async function getFacebookFeed(page, kwargs) {
     throw new AuthRequiredError('www.facebook.com', 'Open Chrome and log in to Facebook before retrying.');
   }
 
+  if (payload.status === 'wrong_surface') {
+    throw new CommandExecutionError(
+      'facebook feed refused to extract from a Messenger/messages page',
+      'Navigate Chrome to https://www.facebook.com/ home news feed and retry.',
+    );
+  }
+
+  if (payload.status === 'no_feed') {
+    throw new CommandExecutionError(
+      'facebook feed could not find the news-feed landmark while Messenger UI was visible',
+      'Close the Messenger drawer/tab and retry `opencli facebook feed`.',
+    );
+  }
+
   if (payload.rows.length > 0) {
-    const messengerBleed = payload.rows.every((row) => !row.author && row.likes === '-' && row.comments === '-' && row.shares === '-');
-    if (messengerBleed) {
+    const messengerRows = payload.rows.filter((row) => rowLooksLikeMessengerBleed(row));
+    if (messengerRows.length === payload.rows.length) {
       throw new CommandExecutionError(
         'facebook feed rows look like Messenger/chat UI instead of news-feed posts',
         'Close the Messenger drawer or messages tab in Chrome and retry `opencli facebook feed`.',
       );
     }
-    return payload.rows;
+    const cleaned = payload.rows.filter((row) => !rowLooksLikeMessengerBleed(row));
+    if (cleaned.length > 0) return cleaned.slice(0, limit);
   }
 
   if (payload.status === 'empty') {
@@ -544,8 +708,14 @@ cli(command);
 export const __test__ = {
   buildFeedExtractScript,
   buildPrepareFeedScript,
+  buildSurfaceCheckScript,
   command,
+  ensureNewsFeedSurface,
+  feedNavigationUrl,
   getFacebookFeed,
   loadFeedPosts,
+  readFeedSurface,
   requireLimit,
+  rowLooksLikeMessengerBleed,
+  selectNonMessengerFacebookTab,
 };
