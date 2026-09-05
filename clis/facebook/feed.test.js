@@ -34,6 +34,7 @@ function runSurface(html, url = 'https://www.facebook.com/') {
 function createPage(payload, options = {}) {
   const surface = {
     ready: true,
+    landmark: 'role-feed',
     feedFound: true,
     messengerDom: false,
     isMessagesRoute: false,
@@ -55,11 +56,11 @@ function createPage(payload, options = {}) {
       if (source.includes('primaryContainers') || source.includes('wrong_surface') || source.includes('extractPost')) {
         return Promise.resolve(payload);
       }
-      if (source.includes('isMessagesRoute') && source.includes('feedFound')) {
-        return Promise.resolve(surface);
-      }
-      if (source.includes('redirecting') || source.includes('Close chat')) {
+      if (source.includes('redirecting')) {
         return Promise.resolve(prepare);
+      }
+      if (source.includes('visibilityState') && source.includes('pagelets')) {
+        return Promise.resolve(surface);
       }
       if (source.includes('scrollHeight') || source.includes('scrollTop')) {
         return Promise.resolve(0);
@@ -557,7 +558,7 @@ describe('facebook feed', () => {
     const page = {
       goto: vi.fn().mockResolvedValue(undefined),
       wait: vi.fn().mockResolvedValue(undefined),
-      evaluate: vi.fn().mockResolvedValue({ ready: true, feedFound: true, messengerDom: false, isMessagesRoute: false, onHome: true, path: '/' }),
+      evaluate: vi.fn().mockResolvedValue({ ready: true, feedFound: true, landmark: 'role-feed', messengerDom: false, isMessagesRoute: false, onHome: true, path: '/' }),
     };
 
     await __test__.ensureNewsFeedSurface(page);
@@ -566,13 +567,266 @@ describe('facebook feed', () => {
     expect(page.tabs).toBeUndefined();
   });
 
-  it('fails fast when the news-feed surface never becomes ready', async () => {
-    const page = createPage({ status: 'ok', rows: [] }, {
-      surface: { ready: false, feedFound: false, messengerDom: true, isMessagesRoute: false, path: '/' },
+  // Live smoke (#2453 stack): path=/ but no landmark after ~20s. The old loop
+  // re-navigated on every attempt, resetting Facebook's slow hydration under
+  // the proxy. Navigate once, then poll the same document until it appears.
+  it('navigates once and polls the same document until the feed landmark hydrates', async () => {
+    let probes = 0;
+    const page = {
+      goto: vi.fn().mockResolvedValue(undefined),
+      sleep: vi.fn().mockResolvedValue(undefined),
+      evaluate: vi.fn().mockImplementation((script) => {
+        const source = String(script);
+        if (source.includes('redirecting')) return Promise.resolve({ status: 'ready', actions: [] });
+        probes += 1;
+        return Promise.resolve(probes < 4
+          ? { ready: false, landmark: null, onHome: true, path: '/' }
+          : { ready: true, landmark: 'feed-units', onHome: true, path: '/' });
+      }),
+    };
+
+    let clock = 0;
+    const surface = await __test__.ensureNewsFeedSurface(page, {
+      timeoutMs: 30000,
+      pollMs: 1500,
+      now: () => { clock += 1000; return clock; },
     });
 
-    await expect(__test__.command.func(page, { limit: 1 }))
-      .rejects.toThrow(/news-feed surface did not render/);
+    expect(surface.ready).toBe(true);
+    expect(surface.landmark).toBe('feed-units');
+    expect(page.goto).toHaveBeenCalledTimes(1);
+    expect(probes).toBe(4);
+    expect(page.sleep).toHaveBeenCalledTimes(3);
+  });
+
+  it('nudges the SPA via the Home control once when no landmark appears for a while', async () => {
+    const page = {
+      goto: vi.fn().mockResolvedValue(undefined),
+      sleep: vi.fn().mockResolvedValue(undefined),
+      evaluate: vi.fn().mockImplementation((script) => {
+        const source = String(script);
+        if (source.includes('redirecting')) {
+          return Promise.resolve({ status: 'ready', actions: /!landmark && true/.test(source) ? ['click-home'] : [] });
+        }
+        return Promise.resolve({ ready: false, landmark: null, onHome: true, path: '/' });
+      }),
+    };
+
+    let clock = 0;
+    await __test__.ensureNewsFeedSurface(page, {
+      timeoutMs: 12000,
+      pollMs: 1000,
+      homeClickAfterMs: 3000,
+      now: () => { clock += 1000; return clock; },
+    });
+
+    const prepareCalls = page.evaluate.mock.calls
+      .map(([script]) => String(script))
+      .filter((source) => source.includes('redirecting'));
+    const homeClickCalls = prepareCalls.filter((source) => /!landmark && true/.test(source));
+    expect(prepareCalls.length).toBeGreaterThan(3);
+    expect(homeClickCalls).toHaveLength(1);
+    // Never re-navigates while polling; a second goto would reset hydration.
+    expect(page.goto).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-navigates home at most once when the document lands on a messages route', async () => {
+    let prepares = 0;
+    const page = {
+      goto: vi.fn().mockResolvedValue(undefined),
+      sleep: vi.fn().mockResolvedValue(undefined),
+      evaluate: vi.fn().mockImplementation((script) => {
+        const source = String(script);
+        if (source.includes('redirecting')) {
+          prepares += 1;
+          return Promise.resolve(prepares === 1 ? { status: 'redirecting', actions: ['redirect-home'] } : { status: 'ready', actions: [] });
+        }
+        return Promise.resolve(prepares >= 2
+          ? { ready: true, landmark: 'role-feed', onHome: true, path: '/' }
+          : { ready: false, landmark: null, isMessagesRoute: true, path: '/messages/t/1' });
+      }),
+    };
+
+    const surface = await __test__.ensureNewsFeedSurface(page, { timeoutMs: 10000, pollMs: 1000, now: (() => { let c = 0; return () => (c += 500); })() });
+    expect(surface.ready).toBe(true);
+    expect(page.goto).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails with structural diagnostics when the news-feed surface never becomes ready', async () => {
+    const page = createPage({ status: 'ok', rows: [] }, {
+      surface: {
+        ready: false,
+        landmark: null,
+        feedFound: false,
+        feedUnitCount: 0,
+        postMenuCount: 0,
+        articleCount: 2,
+        messengerDom: true,
+        chatChromeCount: 1,
+        isMessagesRoute: false,
+        path: '/',
+        visibilityState: 'hidden',
+        readyState: 'complete',
+        pagelets: ['LeftRail', 'RightRail', 'ChatTab'],
+        dialogs: [],
+      },
+    });
+
+    const err = await __test__.command.func(page, { limit: 1 }).catch((e) => e);
+    expect(err).toBeInstanceOf(CommandExecutionError);
+    expect(err.message).toMatch(/news-feed surface did not render/);
+    expect(err.hint).toContain('landmark=none');
+    expect(err.hint).toContain('visibility=hidden');
+    expect(err.hint).toContain('pagelets=LeftRail,RightRail,ChatTab');
+    expect(err.hint).toContain('chatChrome=1');
+  });
+
+  it('does not treat the top-nav Messenger icon as embedded chat chrome', () => {
+    const payload = runSurface(`
+      <div role="banner">
+        <a aria-label="Messenger" href="/messages/"></a>
+        <a aria-label="Home" href="/"></a>
+      </div>
+      <main role="main">
+        <div role="feed">
+          <div role="article"><div dir="auto">A post long enough to be a real feed entry here.</div></div>
+        </div>
+      </main>
+    `);
+
+    expect(payload.ready).toBe(true);
+    expect(payload.landmark).toBe('role-feed');
+    expect(payload.messengerDom).toBe(false);
+    expect(payload.chatChromeCount).toBe(0);
+  });
+
+  it('flags docked chat windows beside the feed as chat chrome without blocking readiness', () => {
+    const payload = runSurface(`
+      <main role="main">
+        <div role="feed"><div role="article"><div dir="auto">Real feed content lives here.</div></div></div>
+      </main>
+      <div role="complementary">
+        <div aria-label="Conversation with Someone">
+          <div dir="auto">Message sent February 26, 2026</div>
+          <button aria-label="Close chat"></button>
+        </div>
+      </div>
+    `);
+
+    expect(payload.ready).toBe(true);
+    expect(payload.messengerDom).toBe(true);
+    expect(payload.chatChromeCount).toBeGreaterThan(0);
+  });
+
+  it('accepts FeedUnit pagelets as the news-feed landmark when role=feed is absent', () => {
+    const payload = runSurface(`
+      <main role="main">
+        <div data-pagelet="FeedUnit_0">
+          <h3><a role="link" href="https://www.facebook.com/alice">Alice</a></h3>
+          <div dir="auto">Modern home variant with no role=feed wrapper at all.</div>
+          <button aria-label="Actions for this post by Alice"></button>
+        </div>
+        <div data-pagelet="FeedUnit_1"><div dir="auto">Second unit.</div></div>
+      </main>
+    `);
+
+    expect(payload.ready).toBe(true);
+    expect(payload.landmark).toBe('feed-units');
+    expect(payload.feedFound).toBe(false);
+    expect(payload.feedUnitCount).toBe(2);
+    expect(payload.pagelets).toEqual(['FeedUnit_n']);
+  });
+
+  it('accepts per-post action menus as the landmark and ignores menus inside chat chrome', () => {
+    const payload = runSurface(`
+      <main role="main">
+        <div>
+          <div dir="auto">A modern post body with enough words to be a real feed entry.</div>
+          <button aria-label="Actions for this post by Bob"></button>
+        </div>
+        <div data-pagelet="ChatTab">
+          <button aria-label="Actions for this post by Chat Decoy"></button>
+        </div>
+      </main>
+    `);
+
+    expect(payload.landmark).toBe('post-menus');
+    expect(payload.postMenuCount).toBe(1);
+    expect(payload.ready).toBe(true);
+  });
+
+  it('extracts FeedUnit posts on home without role=feed and skips a docked chat window', () => {
+    const payload = runExtract(`
+      <main role="main">
+        <div data-pagelet="FeedUnit_0">
+          <h3><a role="link" href="https://www.facebook.com/alice">Alice Poster</a></h3>
+          <div dir="auto">Modern home variant post body that must be extracted with its author.</div>
+          <span>All: 4</span>
+          <button aria-label="Actions for this post by Alice Poster"></button>
+        </div>
+      </main>
+      <div role="complementary">
+        <div aria-label="Conversation with Teiki Travels">
+          <div role="article">
+            <div dir="auto">Teiki Travels email exchange with enough text to look like a feed post.</div>
+            <div dir="auto">Message sent February 26, 2026</div>
+            <div dir="auto">Enter</div>
+            <button aria-label="Send">Send</button>
+            <button aria-label="Like">Like</button>
+            <button aria-label="Close chat"></button>
+          </div>
+        </div>
+      </div>
+    `, 5, 'https://www.facebook.com/', { wrapFeed: false });
+
+    expect(payload.status).toBe('ok');
+    expect(payload.diagnostics.surface.landmark).toBe('feed-units');
+    expect(payload.rows).toHaveLength(1);
+    expect(payload.rows[0]).toMatchObject({ author: 'Alice Poster', likes: '4' });
+    expect(payload.rows[0].content).not.toMatch(/Message sent|Enter|Teiki/);
+  });
+
+  it('closes docked chats and dialogs in the prepare step without touching accept buttons', () => {
+    const dom = new JSDOM(`
+      <main role="main"></main>
+      <div role="complementary">
+        <div aria-label="Conversation with Someone"><button aria-label="Close chat"></button></div>
+      </div>
+      <div role="dialog" aria-label="Allow cookies?">
+        <button aria-label="Close"></button>
+        <button>Allow all cookies</button>
+      </div>
+    `, { url: 'https://www.facebook.com/' });
+    const clicked = [];
+    for (const btn of dom.window.document.querySelectorAll('button')) {
+      btn.click = () => clicked.push(btn.getAttribute('aria-label') || btn.textContent.trim());
+    }
+
+    const result = Function('window', 'document', `return ${__test__.buildPrepareFeedScript({ clickHome: false })};`)(dom.window, dom.window.document);
+
+    expect(result.actions).toEqual(['close-chat', 'close-dialog']);
+    expect(clicked).toEqual(['Close chat', 'Close']);
+    expect(clicked).not.toContain('Allow all cookies');
+  });
+
+  it('clicks the banner Home control only when asked and no landmark exists', () => {
+    const html = `
+      <div role="banner"><a aria-label="Home" href="/"></a></div>
+      <main role="main"><div>nothing yet</div></main>
+    `;
+    const run = (clickHome) => {
+      const dom = new JSDOM(html, { url: 'https://www.facebook.com/' });
+      const home = dom.window.document.querySelector('a[aria-label="Home"]');
+      let clicks = 0;
+      home.click = () => { clicks += 1; };
+      const result = Function('window', 'document', `return ${__test__.buildPrepareFeedScript({ clickHome })};`)(dom.window, dom.window.document);
+      return { clicks, result };
+    };
+
+    expect(run(false).clicks).toBe(0);
+    const nudged = run(true);
+    expect(nudged.clicks).toBe(1);
+    expect(nudged.result.actions).toContain('click-home');
   });
 
   it('fails fast when the active tab is a Messenger route', async () => {
