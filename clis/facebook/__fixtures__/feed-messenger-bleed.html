@@ -1,16 +1,15 @@
-<!-- Synthetic fixture for Messenger/chat UI bleed on facebook.com home.
-     Not captured from a live account; encodes the failure mode reported in #2453. -->
+<!-- Synthetic fixture: embedded Messenger/chat column on facebook.com home.
+     No /messages tab and no aria-label="Messenger" — chat chrome lives in role=main. -->
 <main role="main">
-  <aside aria-label="Messenger" data-pagelet="ChatTab">
+  <section data-pagelet="ChatComposer">
     <div role="article">
-      <a href="https://www.facebook.com/messages/t/123">Teiki Travels</a>
       <div dir="auto">Teiki Travels email exchange with enough text to resemble a feed post.</div>
       <div dir="auto">Message sent February 26, 2026</div>
       <div dir="auto">Enter</div>
+      <button aria-label="Send">Send</button>
       <button aria-label="Like">Like</button>
-      <button aria-label="Comment">Comment</button>
     </div>
-  </aside>
+  </section>
   <div role="feed">
     <div role="article">
       <h3><a role="link" href="https://www.facebook.com/real-poster">Real Poster</a></h3>

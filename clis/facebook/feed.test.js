@@ -9,8 +9,20 @@ import { __test__ } from './feed.js';
 
 const fixtureDir = dirname(fileURLToPath(import.meta.url));
 
-function runExtract(html, limit = 10, url = 'https://www.facebook.com/') {
-  const dom = new JSDOM(html, { url });
+function wrapHomeFeedHtml(html) {
+  if (html.includes('role="feed"')) return html;
+  if (html.includes('<main role="main">')) {
+    return html.replace('<main role="main">', '<main role="main"><div role="feed">')
+      .replace(/<\/main>\s*$/, '</div></main>');
+  }
+  return `<main role="main"><div role="feed">${html}</div></main>`;
+}
+
+function runExtract(html, limit = 10, url = 'https://www.facebook.com/', options = {}) {
+  const { wrapFeed = true } = options;
+  const onHome = /^https:\/\/www\.facebook\.com\/?(?:\?.*)?$/i.test(url);
+  const documentHtml = wrapFeed && onHome ? wrapHomeFeedHtml(html) : html;
+  const dom = new JSDOM(documentHtml, { url });
   return Function('window', 'document', `return ${__test__.buildFeedExtractScript(limit)};`)(dom.window, dom.window.document);
 }
 
@@ -465,33 +477,63 @@ describe('facebook feed', () => {
     expect(payload.rows[0].likes).toBe('8');
   });
 
-  it('returns no rows when only Messenger thread chrome is visible', () => {
+  it('returns no rows when only embedded chat chrome is visible on home', () => {
     const payload = runExtract(`
       <main role="main">
-        <section aria-label="Chats" data-pagelet="ChatComposer">
+        <section>
           <div role="article">
             <div dir="auto">Conversation preview that should never become a feed row.</div>
             <div dir="auto">Message sent March 1, 2026</div>
             <div dir="auto">Enter</div>
-            <a href="https://www.facebook.com/messages/t/thread-1">Open thread</a>
+            <button aria-label="Send">Send</button>
+            <button aria-label="Like">Like</button>
           </div>
         </section>
       </main>
-    `, 5);
+    `, 5, 'https://www.facebook.com/', { wrapFeed: false });
 
     expect(payload.status).toBe('no_feed');
     expect(payload.rows).toEqual([]);
   });
 
+  it('ignores embedded chat columns outside role=feed on facebook.com home', () => {
+    const payload = runExtract(`
+      <main role="main">
+        <section>
+          <div role="article">
+            <div dir="auto">Teiki Travels email exchange with enough text to resemble a feed post.</div>
+            <div dir="auto">Message sent February 26, 2026</div>
+            <div dir="auto">Enter</div>
+            <button aria-label="Send">Send</button>
+            <button aria-label="Like">Like</button>
+          </div>
+        </section>
+        <div role="feed">
+          <div role="article">
+            <h3><a role="link" href="https://www.facebook.com/real-poster">Real Poster</a></h3>
+            <div dir="auto">A genuine news-feed post body long enough to extract cleanly.</div>
+            <button aria-label="Actions for this post by Real Poster"></button>
+          </div>
+        </div>
+      </main>
+    `, 5, 'https://www.facebook.com/', { wrapFeed: false });
+
+    expect(payload.status).toBe('ok');
+    expect(payload.rows).toHaveLength(1);
+    expect(payload.rows[0].author).toBe('Real Poster');
+  });
+
   it('refuses messenger routes before extraction', () => {
     const payload = runExtract(`
       <main role="main">
-        <div role="article">
-          <div dir="auto">Message sent February 26, 2026</div>
-          <div dir="auto">Enter</div>
+        <div role="feed">
+          <div role="article">
+            <div dir="auto">Message sent February 26, 2026</div>
+            <div dir="auto">Enter</div>
+          </div>
         </div>
       </main>
-    `, 5, 'https://www.facebook.com/messages/t/123');
+    `, 5, 'https://www.facebook.com/messages/t/123', { wrapFeed: false });
 
     expect(payload.status).toBe('wrong_surface');
     expect(payload.rows).toEqual([]);
@@ -511,21 +553,17 @@ describe('facebook feed', () => {
     expect(payload.feedFound).toBe(false);
   });
 
-  it('selects a non-messages facebook tab before navigating home', async () => {
+  it('navigates to cache-busted facebook.com home and waits for role=feed', async () => {
     const page = {
       goto: vi.fn().mockResolvedValue(undefined),
       wait: vi.fn().mockResolvedValue(undefined),
-      tabs: vi.fn().mockResolvedValue([
-        { index: 0, page: 'messages-tab', url: 'https://www.facebook.com/messages/t/123', title: 'Messenger' },
-        { index: 1, page: 'home-tab', url: 'https://www.facebook.com/', title: 'Facebook' },
-      ]),
-      selectTab: vi.fn().mockResolvedValue(undefined),
-      evaluate: vi.fn().mockResolvedValue({ ready: true, feedFound: true, messengerDom: false, isMessagesRoute: false, path: '/' }),
+      evaluate: vi.fn().mockResolvedValue({ ready: true, feedFound: true, messengerDom: false, isMessagesRoute: false, onHome: true, path: '/' }),
     };
 
     await __test__.ensureNewsFeedSurface(page);
-    expect(page.selectTab).toHaveBeenCalledWith('home-tab');
     expect(page.goto).toHaveBeenCalled();
+    expect(String(page.goto.mock.calls[0][0])).toContain('_opencli_feed=');
+    expect(page.tabs).toBeUndefined();
   });
 
   it('fails fast when the news-feed surface never becomes ready', async () => {
@@ -543,7 +581,7 @@ describe('facebook feed', () => {
     });
 
     await expect(__test__.command.func(page, { limit: 1 }))
-      .rejects.toThrow(/Messenger\/messages tab/);
+      .rejects.toThrow(/Messenger\/messages route/);
   });
 
   it('maps messenger-only extraction payloads to a typed bleed error', async () => {
