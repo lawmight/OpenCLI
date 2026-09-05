@@ -1,8 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { ArgumentError, AuthRequiredError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
 import { getRegistry } from '@jackwener/opencli/registry';
 import { __test__ } from './feed.js';
+
+const fixtureDir = dirname(fileURLToPath(import.meta.url));
 
 function runExtract(html, limit = 10, url = 'https://www.facebook.com/') {
   const dom = new JSDOM(html, { url });
@@ -408,5 +413,50 @@ describe('facebook feed', () => {
 
     expect(payload.status).toBe('ok');
     expect(payload.rows[0].content).toBe('Genuine post body that should remain readable after decoy filtering.');
+  });
+
+  it('ignores Messenger/chat bleed and keeps scoped news-feed posts', () => {
+    const html = readFileSync(resolve(fixtureDir, '__fixtures__/feed-messenger-bleed.html'), 'utf8');
+    const payload = runExtract(html, 5);
+
+    expect(payload.status).toBe('ok');
+    expect(payload.diagnostics.feedFound).toBe(true);
+    expect(payload.rows).toHaveLength(1);
+    expect(payload.rows[0].author).toBe('Real Poster');
+    expect(payload.rows[0].content).toContain('genuine news-feed post');
+    expect(payload.rows[0].likes).toBe('8');
+  });
+
+  it('returns no rows when only Messenger thread chrome is visible', () => {
+    const payload = runExtract(`
+      <main role="main">
+        <section aria-label="Chats" data-pagelet="ChatComposer">
+          <div role="article">
+            <div dir="auto">Conversation preview that should never become a feed row.</div>
+            <div dir="auto">Message sent March 1, 2026</div>
+            <div dir="auto">Enter</div>
+            <a href="https://www.facebook.com/messages/t/thread-1">Open thread</a>
+          </div>
+        </section>
+      </main>
+    `, 5);
+
+    expect(payload.status).toBe('no_rows');
+    expect(payload.rows).toEqual([]);
+  });
+
+  it('maps messenger-only extraction payloads to a typed bleed error', async () => {
+    const page = createPage({
+      status: 'ok',
+      rows: [
+        { index: 1, author: '', content: 'Message sent February 26, 2026 Enter', likes: '-', comments: '-', shares: '-' },
+        { index: 2, author: '', content: 'Teiki Travels email exchange', likes: '-', comments: '-', shares: '-' },
+      ],
+    });
+
+    await expect(__test__.command.func(page, { limit: 2 }))
+      .rejects.toBeInstanceOf(CommandExecutionError);
+    await expect(__test__.command.func(page, { limit: 2 }))
+      .rejects.toThrow(/Messenger\/chat UI/);
   });
 });

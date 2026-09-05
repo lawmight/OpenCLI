@@ -19,6 +19,29 @@ function unwrapBrowserResult(value) {
   return value;
 }
 
+function buildPrepareFeedScript() {
+  return `(() => {
+    const path = window.location && window.location.pathname ? window.location.pathname : '';
+    const hash = window.location && window.location.hash ? window.location.hash : '';
+    if (/^\\/messages(\\/|$)/.test(path) || /messages/i.test(hash)) {
+      window.location.assign('https://www.facebook.com/');
+      return { status: 'redirecting', feedFound: false };
+    }
+
+    // Messenger drawer/overlay can sit above the news feed on an otherwise
+    // normal home URL. Close it when we can identify the chrome safely.
+    const messengerRoot = document.querySelector('[aria-label="Messenger"], [aria-label="Chats"], [data-pagelet*="Chat"]');
+    if (messengerRoot) {
+      const close = messengerRoot.querySelector('[aria-label="Close"], [aria-label="Close chat"], [aria-label="关闭"], [aria-label="关闭聊天"]');
+      if (close && typeof close.click === 'function') close.click();
+    }
+
+    const feed = document.querySelector('[role="main"] [role="feed"]')
+      || document.querySelector('[role="feed"]');
+    return { status: 'ready', feedFound: !!feed, path };
+  })()`;
+}
+
 function buildFeedExtractScript(limit) {
   return `(() => {
     const limit = ${limit};
@@ -95,6 +118,52 @@ function buildFeedExtractScript(limit) {
     function isTimestampText(text) {
       return /^(\\d+\\s*(s|m|h|d|w|mo|yr|min|sec|second|minute|hour|day|week|month|year)s?|Just now|Yesterday|刚刚|昨天|\\d+小时|\\d+天)(\\s*[·•.])?$/i.test(text)
         || /(?:·\\s*)?Shared with Public$/i.test(text);
+    }
+
+    function feedRoot() {
+      const scoped = document.querySelector('[role="main"] [role="feed"]')
+        || document.querySelector('[role="feed"]');
+      if (scoped) return scoped;
+      const main = document.querySelector('[role="main"]');
+      return main || document.body;
+    }
+
+    function isInsideMessenger(node) {
+      for (let el = node; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+        const aria = labelOf(el);
+        if (/^(Messenger|Chats|Chat|New message|消息|聊天)$/i.test(aria)) return true;
+        const pagelet = el.getAttribute && el.getAttribute('data-pagelet') || '';
+        if (/chat|messenger/i.test(pagelet)) return true;
+        const testId = el.getAttribute && el.getAttribute('data-testid') || '';
+        if (/messenger|chat-tab|message-thread/i.test(testId)) return true;
+      }
+      return false;
+    }
+
+    function isMessengerOrChatText(text) {
+      if (!text) return false;
+      if (/^Enter$/i.test(text)) return true;
+      if (/^Message sent\\b/i.test(text)) return true;
+      if (/\\bMessage sent\\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{1,2},\\s+\\d{4}\\b/i.test(text)) return true;
+      if (/\\b(Active now|Seen|Delivered|Typing\\.\\.\\.|Write to|Send a message|Start a new chat)\\b/i.test(text)) return true;
+      if (/\\b(you sent|sent a photo|sent a video|sent an attachment)\\b/i.test(text)) return true;
+      return false;
+    }
+
+    function isMessengerContainer(root) {
+      if (!root || isInsideMessenger(root)) return true;
+      if (root.querySelector('a[href*="/messages/t/"], a[href*="/messages/e2ee/"], a[href*="/messages/group/"]')) return true;
+      const fullText = textOf(root);
+      if (isMessengerOrChatText(fullText)) return true;
+      const blocks = visibleBlocks(root);
+      const messengerBlocks = blocks.filter((block) => isMessengerOrChatText(block));
+      if (messengerBlocks.length > 0 && messengerBlocks.length >= Math.max(1, Math.floor(blocks.length / 2))) return true;
+      return false;
+    }
+
+    function withinFeedScope(node) {
+      const root = feedRoot();
+      return root.contains(node) && !isInsideMessenger(node) && !isMessengerContainer(node);
     }
 
     function postUrlFrom(root) {
@@ -175,6 +244,7 @@ function buildFeedExtractScript(limit) {
     function extractPost(root, index) {
       const fullText = textOf(root);
       if (!fullText || isSuggestionOrChrome(fullText) || isSponsored(fullText)) return null;
+      if (isMessengerContainer(root)) return null;
 
       const author = findAuthor(root);
       const blocks = contentBlocks(root, author);
@@ -184,6 +254,8 @@ function buildFeedExtractScript(limit) {
 
       if (!author && !content) return null;
       if (!content && !postUrl && kinds.size < 2) return null;
+      if (!author && isMessengerOrChatText(content)) return null;
+      if (isMessengerOrChatText(content)) return null;
 
       const likesMatch = fullText.match(/所有心情：\\s*(\\d[\\d,.\\s万亿KMk]*)/)
         || fullText.match(/All:\\s*(\\d[\\d,.KMk]*)/)
@@ -204,8 +276,10 @@ function buildFeedExtractScript(limit) {
     }
 
     function primaryContainers() {
-      return Array.from(document.querySelectorAll('[role="article"]'))
+      const root = feedRoot();
+      return Array.from(root.querySelectorAll('[role="article"]'))
         .filter((el) => {
+          if (!withinFeedScope(el)) return false;
           if (textOf(el).length <= 30) return false;
           const hasCommentScopedLink = Boolean(el.querySelector('a[href*="comment_id="]'));
           const hasPostMenu = Array.from(el.querySelectorAll('[aria-label]'))
@@ -222,8 +296,9 @@ function buildFeedExtractScript(limit) {
     function actionMenuAnchors() {
       // Post menus only — NOT "Actions for this comment", so the anchor set,
       // countMenus, and loadFeedPosts all key on the same thing (#2089).
-      return Array.from(document.querySelectorAll('[aria-label]'))
-        .filter((el) => isPostActionLabel(labelOf(el)));
+      const root = feedRoot();
+      return Array.from(root.querySelectorAll('[aria-label]'))
+        .filter((el) => isPostActionLabel(labelOf(el)) && withinFeedScope(el));
     }
 
     function actionAnchoredContainers() {
@@ -268,7 +343,7 @@ function buildFeedExtractScript(limit) {
     }
 
     function fallbackContainers() {
-      const main = document.querySelector('[role="main"]');
+      const main = feedRoot();
       if (!main) return [];
       const buttons = Array.from(main.querySelectorAll('[aria-label="Like"], [aria-label="赞"], [aria-label="Comment"], [aria-label="评论"], [aria-label="Share"], [aria-label="分享"]'));
       const seen = new WeakSet();
@@ -280,7 +355,7 @@ function buildFeedExtractScript(limit) {
           const kinds = actionKinds(node);
           const blocks = visibleBlocks(node);
           const hasPostEvidence = Boolean(postUrlFrom(node)) || blocks.some((block) => block.length > 20 && !isActionText(block) && !isMetricText(block));
-          if (text.length >= 80 && kinds.has('like') && (kinds.has('comment') || kinds.has('share')) && hasPostEvidence) {
+          if (text.length >= 80 && kinds.has('like') && (kinds.has('comment') || kinds.has('share')) && hasPostEvidence && withinFeedScope(node)) {
             if (!seen.has(node)) {
               seen.add(node);
               containers.push(node);
@@ -325,6 +400,7 @@ function buildFeedExtractScript(limit) {
         actionMenuCount: actionMenuAnchors().length,
         fallbackActionCount: document.querySelectorAll('[role="main"] [aria-label="Like"], [role="main"] [aria-label="赞"], [role="main"] [aria-label="Comment"], [role="main"] [aria-label="评论"]').length,
         mainTextLength: textOf(document.querySelector('[role="main"]')).length,
+        feedFound: !!document.querySelector('[role="main"] [role="feed"], [role="feed"]'),
       },
     };
   })()`;
@@ -336,11 +412,17 @@ function buildFeedExtractScript(limit) {
 async function loadFeedPosts(page, limit) {
   const scrollStep = `(async () => {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const feed = document.querySelector('[role="main"] [role="feed"]')
+      || document.querySelector('[role="feed"]')
+      || document.querySelector('[role="main"]')
+      || document.body;
+    feed.scrollTop = feed.scrollHeight;
     window.scrollTo(0, document.body.scrollHeight);
     await sleep(800);
-    return document.querySelectorAll('[aria-label]').length
-      ? document.querySelectorAll('[role="article"]').length
-        + Array.from(document.querySelectorAll('[aria-label]')).filter((el) => /^(Actions for this post(?: by .+)?|此帖子的操作|针对此帖子的操作|贴文的操作)$/i.test((el.getAttribute('aria-label') || '').trim())).length
+    const root = feed;
+    return root.querySelectorAll('[aria-label]').length
+      ? root.querySelectorAll('[role="article"]').length
+        + Array.from(root.querySelectorAll('[aria-label]')).filter((el) => /^(Actions for this post(?: by .+)?|此帖子的操作|针对此帖子的操作|贴文的操作)$/i.test((el.getAttribute('aria-label') || '').trim())).length
       : 0;
   })()`;
   const extractStep = buildFeedExtractScript(limit);
@@ -386,6 +468,15 @@ async function getFacebookFeed(page, kwargs) {
     );
   }
 
+  try {
+    const prepared = unwrapBrowserResult(await page.evaluate(buildPrepareFeedScript()));
+    if (prepared && prepared.status === 'redirecting') {
+      await page.goto(FACEBOOK_HOME, { settleMs: 4000 });
+    }
+  } catch {
+    // Preparation is best-effort; extraction still owns final error classification.
+  }
+
   await loadFeedPosts(page, limit);
 
   let payload;
@@ -407,6 +498,13 @@ async function getFacebookFeed(page, kwargs) {
   }
 
   if (payload.rows.length > 0) {
+    const messengerBleed = payload.rows.every((row) => !row.author && row.likes === '-' && row.comments === '-' && row.shares === '-');
+    if (messengerBleed) {
+      throw new CommandExecutionError(
+        'facebook feed rows look like Messenger/chat UI instead of news-feed posts',
+        'Close the Messenger drawer or messages tab in Chrome and retry `opencli facebook feed`.',
+      );
+    }
     return payload.rows;
   }
 
@@ -445,6 +543,7 @@ cli(command);
 
 export const __test__ = {
   buildFeedExtractScript,
+  buildPrepareFeedScript,
   command,
   getFacebookFeed,
   loadFeedPosts,
