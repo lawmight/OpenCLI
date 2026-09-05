@@ -1,18 +1,71 @@
 import { describe, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { ArgumentError, AuthRequiredError, CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
 import { getRegistry } from '@jackwener/opencli/registry';
 import { __test__ } from './feed.js';
 
-function runExtract(html, limit = 10, url = 'https://www.facebook.com/') {
-  const dom = new JSDOM(html, { url });
+const fixtureDir = dirname(fileURLToPath(import.meta.url));
+
+function wrapHomeFeedHtml(html) {
+  if (html.includes('role="feed"')) return html;
+  if (html.includes('<main role="main">')) {
+    return html.replace('<main role="main">', '<main role="main"><div role="feed">')
+      .replace(/<\/main>\s*$/, '</div></main>');
+  }
+  return `<main role="main"><div role="feed">${html}</div></main>`;
+}
+
+function runExtract(html, limit = 10, url = 'https://www.facebook.com/', options = {}) {
+  const { wrapFeed = true } = options;
+  const onHome = /^https:\/\/www\.facebook\.com\/?(?:\?.*)?$/i.test(url);
+  const documentHtml = wrapFeed && onHome ? wrapHomeFeedHtml(html) : html;
+  const dom = new JSDOM(documentHtml, { url });
   return Function('window', 'document', `return ${__test__.buildFeedExtractScript(limit)};`)(dom.window, dom.window.document);
 }
 
-function createPage(payload) {
+function runSurface(html, url = 'https://www.facebook.com/') {
+  const dom = new JSDOM(html, { url });
+  return Function('window', 'document', `return ${__test__.buildSurfaceCheckScript()};`)(dom.window, dom.window.document);
+}
+
+function createPage(payload, options = {}) {
+  const surface = {
+    ready: true,
+    feedFound: true,
+    messengerDom: false,
+    isMessagesRoute: false,
+    onHome: true,
+    path: '/',
+    hash: '',
+    href: 'https://www.facebook.com/',
+    ...options.surface,
+  };
+  const prepare = { status: 'ready', feedFound: true, path: '/', ...options.prepare };
+
   return {
     goto: vi.fn().mockResolvedValue(undefined),
-    evaluate: vi.fn().mockResolvedValue(payload),
+    wait: vi.fn().mockResolvedValue(undefined),
+    tabs: vi.fn().mockResolvedValue(options.tabs ?? []),
+    selectTab: vi.fn().mockResolvedValue(undefined),
+    evaluate: vi.fn().mockImplementation((script) => {
+      const source = String(script);
+      if (source.includes('primaryContainers') || source.includes('wrong_surface') || source.includes('extractPost')) {
+        return Promise.resolve(payload);
+      }
+      if (source.includes('isMessagesRoute') && source.includes('feedFound')) {
+        return Promise.resolve(surface);
+      }
+      if (source.includes('redirecting') || source.includes('Close chat')) {
+        return Promise.resolve(prepare);
+      }
+      if (source.includes('scrollHeight') || source.includes('scrollTop')) {
+        return Promise.resolve(0);
+      }
+      return Promise.resolve(payload);
+    }),
   };
 }
 
@@ -154,6 +207,8 @@ describe('facebook feed', () => {
       comments: '-',
       shares: '-',
     }]);
+    expect(page.goto).toHaveBeenCalled();
+    expect(String(page.goto.mock.calls[0][0])).toContain('_opencli_feed=');
   });
 
   it('keeps scrolling when raw article markers reach the limit but valid rows do not (#2195)', async () => {
@@ -408,5 +463,158 @@ describe('facebook feed', () => {
 
     expect(payload.status).toBe('ok');
     expect(payload.rows[0].content).toBe('Genuine post body that should remain readable after decoy filtering.');
+  });
+
+  it('ignores Messenger/chat bleed and keeps scoped news-feed posts', () => {
+    const html = readFileSync(resolve(fixtureDir, '__fixtures__/feed-messenger-bleed.html'), 'utf8');
+    const payload = runExtract(html, 5);
+
+    expect(payload.status).toBe('ok');
+    expect(payload.diagnostics.feedFound).toBe(true);
+    expect(payload.rows).toHaveLength(1);
+    expect(payload.rows[0].author).toBe('Real Poster');
+    expect(payload.rows[0].content).toContain('genuine news-feed post');
+    expect(payload.rows[0].likes).toBe('8');
+  });
+
+  it('returns no rows when only embedded chat chrome is visible on home', () => {
+    const payload = runExtract(`
+      <main role="main">
+        <section>
+          <div role="article">
+            <div dir="auto">Conversation preview that should never become a feed row.</div>
+            <div dir="auto">Message sent March 1, 2026</div>
+            <div dir="auto">Enter</div>
+            <button aria-label="Send">Send</button>
+            <button aria-label="Like">Like</button>
+          </div>
+        </section>
+      </main>
+    `, 5, 'https://www.facebook.com/', { wrapFeed: false });
+
+    expect(payload.status).toBe('no_feed');
+    expect(payload.rows).toEqual([]);
+  });
+
+  it('ignores embedded chat columns outside role=feed on facebook.com home', () => {
+    const payload = runExtract(`
+      <main role="main">
+        <section>
+          <div role="article">
+            <div dir="auto">Teiki Travels email exchange with enough text to resemble a feed post.</div>
+            <div dir="auto">Message sent February 26, 2026</div>
+            <div dir="auto">Enter</div>
+            <button aria-label="Send">Send</button>
+            <button aria-label="Like">Like</button>
+          </div>
+        </section>
+        <div role="feed">
+          <div role="article">
+            <h3><a role="link" href="https://www.facebook.com/real-poster">Real Poster</a></h3>
+            <div dir="auto">A genuine news-feed post body long enough to extract cleanly.</div>
+            <button aria-label="Actions for this post by Real Poster"></button>
+          </div>
+        </div>
+      </main>
+    `, 5, 'https://www.facebook.com/', { wrapFeed: false });
+
+    expect(payload.status).toBe('ok');
+    expect(payload.rows).toHaveLength(1);
+    expect(payload.rows[0].author).toBe('Real Poster');
+  });
+
+  it('refuses messenger routes before extraction', () => {
+    const payload = runExtract(`
+      <main role="main">
+        <div role="feed">
+          <div role="article">
+            <div dir="auto">Message sent February 26, 2026</div>
+            <div dir="auto">Enter</div>
+          </div>
+        </div>
+      </main>
+    `, 5, 'https://www.facebook.com/messages/t/123', { wrapFeed: false });
+
+    expect(payload.status).toBe('wrong_surface');
+    expect(payload.rows).toEqual([]);
+  });
+
+  it('detects messenger-only home surfaces without a feed landmark', () => {
+    const payload = runSurface(`
+      <main role="main">
+        <aside aria-label="Messenger" data-pagelet="ChatTab">
+          <a href="https://www.facebook.com/messages/t/123">Teiki Travels</a>
+        </aside>
+      </main>
+    `);
+
+    expect(payload.ready).toBe(false);
+    expect(payload.messengerDom).toBe(true);
+    expect(payload.feedFound).toBe(false);
+  });
+
+  it('navigates to cache-busted facebook.com home and waits for role=feed', async () => {
+    const page = {
+      goto: vi.fn().mockResolvedValue(undefined),
+      wait: vi.fn().mockResolvedValue(undefined),
+      evaluate: vi.fn().mockResolvedValue({ ready: true, feedFound: true, messengerDom: false, isMessagesRoute: false, onHome: true, path: '/' }),
+    };
+
+    await __test__.ensureNewsFeedSurface(page);
+    expect(page.goto).toHaveBeenCalled();
+    expect(String(page.goto.mock.calls[0][0])).toContain('_opencli_feed=');
+    expect(page.tabs).toBeUndefined();
+  });
+
+  it('fails fast when the news-feed surface never becomes ready', async () => {
+    const page = createPage({ status: 'ok', rows: [] }, {
+      surface: { ready: false, feedFound: false, messengerDom: true, isMessagesRoute: false, path: '/' },
+    });
+
+    await expect(__test__.command.func(page, { limit: 1 }))
+      .rejects.toThrow(/news-feed surface did not render/);
+  });
+
+  it('fails fast when the active tab is a Messenger route', async () => {
+    const page = createPage({ status: 'ok', rows: [] }, {
+      surface: { ready: false, feedFound: false, messengerDom: true, isMessagesRoute: true, path: '/messages/t/123' },
+    });
+
+    await expect(__test__.command.func(page, { limit: 1 }))
+      .rejects.toThrow(/Messenger\/messages route/);
+  });
+
+  it('maps messenger-only extraction payloads to a typed bleed error', async () => {
+    const page = createPage({
+      status: 'ok',
+      rows: [
+        { index: 1, author: '', content: 'Message sent February 26, 2026 Enter', likes: '-', comments: '-', shares: '-' },
+        { index: 2, author: '', content: 'Teiki Travels email exchange', likes: '-', comments: '-', shares: '-' },
+      ],
+    });
+
+    await expect(__test__.command.func(page, { limit: 2 }))
+      .rejects.toBeInstanceOf(CommandExecutionError);
+    await expect(__test__.command.func(page, { limit: 2 }))
+      .rejects.toThrow(/Messenger\/chat UI/);
+  });
+
+  it('filters messenger bleed rows but keeps valid feed rows when mixed', async () => {
+    const page = createPage({
+      status: 'ok',
+      rows: [
+        { index: 1, author: '', content: 'Message sent February 26, 2026 Enter', likes: '-', comments: '-', shares: '-' },
+        { index: 2, author: 'Real Poster', content: 'Genuine feed post body', likes: '3', comments: '-', shares: '-' },
+      ],
+    });
+
+    await expect(__test__.command.func(page, { limit: 2 })).resolves.toEqual([{
+      index: 2,
+      author: 'Real Poster',
+      content: 'Genuine feed post body',
+      likes: '3',
+      comments: '-',
+      shares: '-',
+    }]);
   });
 });
