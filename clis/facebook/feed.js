@@ -3,7 +3,12 @@ import { cli, Strategy } from '@jackwener/opencli/registry';
 
 const FACEBOOK_HOME = 'https://www.facebook.com/';
 const MAX_LIMIT = 50;
-const FEED_SURFACE_ATTEMPTS = 4;
+// Facebook home under a slow proxy can take well over 5s to hydrate the feed
+// column. Navigate ONCE and poll — re-navigating resets the load every time.
+const FEED_SURFACE_TIMEOUT_MS = 30000;
+const FEED_SURFACE_POLL_MS = 1500;
+// After this long without a landmark, nudge the SPA via the Home nav control.
+const FEED_SURFACE_HOME_CLICK_AFTER_MS = 9000;
 
 function requireLimit(value) {
   const n = Number(value);
@@ -29,52 +34,177 @@ function rowLooksLikeMessengerBleed(row) {
   if (row.likes !== '-' || row.comments !== '-' || row.shares !== '-') return false;
   const content = String(row.content || '').trim();
   if (!content) return false;
-  if (/Message sent\b/i.test(content)
-    || /\bEnter\b/.test(content)
-    || /messages\/t\//i.test(content)
-    || /\b(Active now|Seen|Delivered|Typing\.{3})\b/i.test(content)) {
-    return true;
-  }
-  // Top-level feed posts should carry an author or engagement metrics. Authorless
-  // metric-less rows are extraction garbage, commonly Messenger/thread bleed.
+  // Top-level feed posts carry an author or engagement metrics. Authorless,
+  // metric-less rows are extraction garbage — typically docked-chat bleed.
   return true;
 }
 
+// Shared by the surface probe and the extractor so both agree on what counts
+// as "the news feed" and what counts as chat chrome. Keep in sync.
+const FEED_DOM_HELPERS = `
+    const POST_MENU_RE = /^(Actions for this post(?: by .+)?|Actions pour cette publication|此帖子的操作|针对此帖子的操作|贴文的操作)$/i;
+    const OUTSIDE_FEED_ROLES = new Set(['banner', 'navigation', 'complementary', 'contentinfo']);
+    function clean(value) {
+      return String(value || '')
+        .replace(/[\\u034f\\u200b-\\u200f\\u202a-\\u202e\\u2060\\ufeff]/g, '')
+        .replace(/\\s+/g, ' ')
+        .trim();
+    }
+    function attr(el, name) {
+      return el && el.getAttribute ? (el.getAttribute(name) || '') : '';
+    }
+    function isOutsideFeedColumn(node) {
+      for (let el = node; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+        if (OUTSIDE_FEED_ROLES.has(attr(el, 'role'))) return true;
+      }
+      return false;
+    }
+    // Docked chat windows, the chat sidebar, and thread panes — NOT the top-nav
+    // Messenger icon, which is present on every facebook.com page.
+    function isChatChromeNode(el) {
+      if (isOutsideFeedColumn(el) && !/^(Chats|New message)$/i.test(clean(attr(el, 'aria-label')))) {
+        // The right rail (role=complementary) hosts docked chats; keep those, drop banner icons.
+        if (attr(el, 'role') !== 'complementary' && !el.closest('[role="complementary"]')) return false;
+      }
+      const aria = clean(attr(el, 'aria-label'));
+      if (/^(Chats|New message|Close chat|Minimize chat|Nouveau message|Fermer la discussion|关闭聊天|聊天)$/i.test(aria)) return true;
+      if (/^Conversation (with|avec)\\b/i.test(aria)) return true;
+      const pagelet = attr(el, 'data-pagelet');
+      if (/chat|messenger|mwthread/i.test(pagelet)) return true;
+      const testId = attr(el, 'data-testid');
+      if (/messenger|chat-tab|message-thread|mwchat/i.test(testId)) return true;
+      return false;
+    }
+    function isInsideChatChrome(node) {
+      for (let el = node; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+        if (isChatChromeNode(el)) return true;
+      }
+      return false;
+    }
+    function chatChromeNodes() {
+      return Array.from(document.querySelectorAll('[aria-label], [data-pagelet], [data-testid]'))
+        .filter((el) => isChatChromeNode(el));
+    }
+    function mainEl() {
+      return document.querySelector('[role="main"]');
+    }
+    function feedLandmarkEl() {
+      return document.querySelector('[role="main"] [role="feed"]') || document.querySelector('[role="feed"]');
+    }
+    function postMenuEls() {
+      const main = mainEl();
+      if (!main) return [];
+      return Array.from(main.querySelectorAll('[aria-label]'))
+        .filter((el) => POST_MENU_RE.test(clean(attr(el, 'aria-label'))) && !isOutsideFeedColumn(el) && !isInsideChatChrome(el));
+    }
+    function feedUnitEls() {
+      return Array.from(document.querySelectorAll('[data-pagelet^="FeedUnit"], [role="main"] [aria-posinset]'))
+        .filter((el) => !isOutsideFeedColumn(el) && !isInsideChatChrome(el));
+    }
+    // Which structural evidence proves the news-feed column is on screen.
+    // Modern facebook.com variants drop role=feed (see #2089) and mark posts
+    // with FeedUnit pagelets / aria-posinset / per-post action menus instead.
+    function feedLandmarkKind() {
+      if (feedLandmarkEl()) return 'role-feed';
+      if (feedUnitEls().length > 0) return 'feed-units';
+      if (postMenuEls().length > 0) return 'post-menus';
+      return null;
+    }
+    function locationInfo() {
+      const path = window.location && window.location.pathname ? window.location.pathname : '';
+      const hash = window.location && window.location.hash ? window.location.hash : '';
+      const href = window.location && window.location.href ? window.location.href : '';
+      const isMessagesRoute = /^\\/messages(\\/|$)/.test(path)
+        || /\\/messages\\//i.test(hash)
+        || /\\/messages\\//i.test(href);
+      return { path, hash, href, isMessagesRoute, onHome: path === '' || path === '/' };
+    }
+`;
+
 function buildSurfaceCheckScript() {
   return `(() => {
-    function clean(value) {
-      return String(value || '').replace(/\\s+/g, ' ').trim();
-    }
-    function embeddedChatChromePresent() {
-      if (document.querySelector(
-        '[aria-label*="Messenger"], [aria-label*="Chat"], [aria-label*="Conversation"], '
-        + '[data-pagelet*="Chat"], [data-pagelet*="Messenger"], [data-testid*="message-thread"]',
-      )) return true;
-      const body = clean(document.body && document.body.textContent);
-      return /\\bMessage sent\\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{1,2},\\s+\\d{4}\\b/i.test(body)
-        && !document.querySelector('[role="feed"]');
-    }
-    const path = window.location && window.location.pathname ? window.location.pathname : '';
-    const hash = window.location && window.location.hash ? window.location.hash : '';
-    const href = window.location && window.location.href ? window.location.href : '';
-    const isMessagesRoute = /^\\/messages(\\/|$)/.test(path)
-      || /\\/messages\\//i.test(hash)
-      || /\\/messages\\//i.test(href);
-    const feed = document.querySelector('[role="main"] [role="feed"]')
-      || document.querySelector('[role="feed"]');
-    const onHome = path === '' || path === '/';
-    const messengerDom = embeddedChatChromePresent();
-    const ready = !isMessagesRoute && Boolean(feed) && (!onHome || Boolean(feed));
+    ${FEED_DOM_HELPERS}
+    const loc = locationInfo();
+    const landmark = feedLandmarkKind();
+    const chatNodes = chatChromeNodes();
+    const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'))
+      .map((el) => clean(attr(el, 'aria-label')).substring(0, 60))
+      .filter(Boolean)
+      .slice(0, 5);
+    const pagelets = Array.from(new Set(
+      Array.from(document.querySelectorAll('[data-pagelet]'))
+        .map((el) => attr(el, 'data-pagelet').replace(/_\\d+$/, '_n'))
+        .filter(Boolean),
+    )).slice(0, 25);
+    const main = mainEl();
     return {
-      ready,
-      isMessagesRoute,
-      messengerDom,
-      feedFound: Boolean(feed),
-      onHome,
-      path,
-      hash,
-      href: clean(href).substring(0, 200),
+      ready: !loc.isMessagesRoute && landmark !== null,
+      landmark,
+      isMessagesRoute: loc.isMessagesRoute,
+      onHome: loc.onHome,
+      path: loc.path,
+      hash: loc.hash,
+      href: clean(loc.href).substring(0, 200),
+      feedFound: landmark === 'role-feed',
+      feedUnitCount: feedUnitEls().length,
+      postMenuCount: postMenuEls().length,
+      messengerDom: chatNodes.length > 0,
+      chatChromeCount: chatNodes.length,
+      dialogs,
+      pagelets,
+      hasMain: Boolean(main),
+      mainTextLength: main ? clean(main.textContent).length : 0,
+      articleCount: document.querySelectorAll('[role="article"]').length,
+      visibilityState: document.visibilityState,
+      readyState: document.readyState,
+      title: clean(document.title).substring(0, 80),
     };
+  })()`;
+}
+
+function buildPrepareFeedScript(options = {}) {
+  const clickHome = options.clickHome === true;
+  return `(() => {
+    ${FEED_DOM_HELPERS}
+    const actions = [];
+    const loc = locationInfo();
+    if (loc.isMessagesRoute) {
+      window.location.assign(${JSON.stringify(FACEBOOK_HOME)});
+      return { status: 'redirecting', actions: ['redirect-home'] };
+    }
+
+    // Docked chat windows persist across facebook.com pages and drag thread
+    // text into the DOM. Close them; they are re-openable by the user.
+    for (const btn of Array.from(document.querySelectorAll('[aria-label]'))) {
+      const label = clean(attr(btn, 'aria-label'));
+      if (/^(Close chat|Fermer la discussion|关闭聊天)$/i.test(label) && typeof btn.click === 'function') {
+        btn.click();
+        actions.push('close-chat');
+      }
+    }
+    // Modal dialogs (consent / notifications) can block feed hydration. Only
+    // press their own Close control — never an accept/allow button.
+    for (const dialog of Array.from(document.querySelectorAll('[role="dialog"]'))) {
+      const close = dialog.querySelector('[aria-label="Close"], [aria-label="Fermer"], [aria-label="关闭"]');
+      if (close && typeof close.click === 'function') {
+        close.click();
+        actions.push('close-dialog');
+      }
+    }
+
+    let landmark = feedLandmarkKind();
+    if (!landmark && ${clickHome}) {
+      const home = document.querySelector(
+        '[role="banner"] a[aria-label="Home"], [role="banner"] a[aria-label="Accueil"], [role="banner"] a[aria-label="主页"], [role="banner"] a[aria-label="首页"], '
+        + '[role="navigation"] a[aria-label="Home"], [role="navigation"] a[aria-label="Accueil"], [role="banner"] a[href="/"], [role="banner"] a[href="https://www.facebook.com/"]',
+      );
+      if (home && typeof home.click === 'function') {
+        home.click();
+        actions.push('click-home');
+      }
+    }
+    landmark = feedLandmarkKind();
+    return { status: 'ready', landmark, feedFound: landmark === 'role-feed', path: loc.path, actions };
   })()`;
 }
 
@@ -82,108 +212,94 @@ async function readFeedSurface(page) {
   return unwrapBrowserResult(await page.evaluate(buildSurfaceCheckScript()));
 }
 
-async function selectNonMessengerFacebookTab(page) {
-  if (typeof page.tabs !== 'function' || typeof page.selectTab !== 'function') return false;
-  try {
-    const tabs = await page.tabs();
-    if (!Array.isArray(tabs) || tabs.length === 0) return false;
-    const candidate = tabs.find((tab) => {
-      const url = String(tab?.url || '');
-      return /(^|\.)facebook\.com/i.test(url) && !/\/messages(\/|$)/i.test(url);
-    });
-    if (!candidate?.page) return false;
-    await page.selectTab(candidate.page);
-    return true;
-  } catch {
-    return false;
+async function pauseMs(page, ms) {
+  if (typeof page.sleep === 'function') {
+    await page.sleep(ms / 1000);
+    return;
   }
+  if (typeof page.wait === 'function') {
+    await page.wait({ time: ms / 1000 });
+    return;
+  }
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function ensureNewsFeedSurface(page) {
-  let lastSurface = null;
-  for (let attempt = 0; attempt < FEED_SURFACE_ATTEMPTS; attempt += 1) {
+async function ensureNewsFeedSurface(page, options = {}) {
+  const timeoutMs = options.timeoutMs ?? FEED_SURFACE_TIMEOUT_MS;
+  const pollMs = options.pollMs ?? FEED_SURFACE_POLL_MS;
+  const homeClickAfterMs = options.homeClickAfterMs ?? FEED_SURFACE_HOME_CLICK_AFTER_MS;
+  const now = options.now ?? (() => Date.now());
+
+  const navigate = async () => {
     try {
-      await page.goto(feedNavigationUrl(), { settleMs: attempt === 0 ? 4000 : 5000 });
+      await page.goto(feedNavigationUrl(), { settleMs: 4000 });
     } catch (err) {
       throw new CommandExecutionError(
         `Failed to navigate to facebook feed: ${err instanceof Error ? err.message : err}`,
         'Check that facebook.com is reachable and the browser extension is connected.',
       );
     }
+  };
 
+  await navigate();
+  const startedAt = now();
+  // Bound by poll count as well as wall clock so a page whose sleeps return
+  // instantly (mocked or broken timers) cannot spin unbounded.
+  const maxPolls = Math.max(1, Math.ceil(timeoutMs / pollMs));
+  let lastSurface = null;
+  let redirected = false;
+  let homeClicked = false;
+
+  for (let poll = 0; poll < maxPolls; poll += 1) {
+    const elapsed = now() - startedAt;
+    const clickHome = !homeClicked && elapsed >= homeClickAfterMs;
     try {
-      const prepared = unwrapBrowserResult(await page.evaluate(buildPrepareFeedScript()));
-      if (prepared && prepared.status === 'redirecting') {
-        await page.goto(feedNavigationUrl(), { settleMs: 5000 });
+      const prepared = unwrapBrowserResult(await page.evaluate(buildPrepareFeedScript({ clickHome })));
+      if (Array.isArray(prepared?.actions) && prepared.actions.includes('click-home')) homeClicked = true;
+      if (prepared?.status === 'redirecting' && !redirected) {
+        redirected = true;
+        await navigate();
       }
     } catch {
-      // Preparation is best-effort; surface checks own final classification.
+      // Preparation is best-effort; the surface probe owns classification.
     }
 
-    lastSurface = await readFeedSurface(page);
+    try {
+      lastSurface = await readFeedSurface(page);
+    } catch {
+      lastSurface = lastSurface || null;
+    }
     if (lastSurface?.ready) return lastSurface;
 
-    if (typeof page.wait === 'function') {
-      await page.wait(1);
-    }
+    if (now() - startedAt >= timeoutMs || poll === maxPolls - 1) return lastSurface;
+    await pauseMs(page, pollMs);
   }
-
   return lastSurface;
 }
 
-function buildPrepareFeedScript() {
-  return `(() => {
-    function dismissEmbeddedChatChrome() {
-      const selectors = [
-        '[aria-label="Close"]',
-        '[aria-label="Close chat"]',
-        '[aria-label="Minimize chat"]',
-        '[aria-label="关闭"]',
-        '[aria-label="关闭聊天"]',
-      ];
-      const roots = Array.from(document.querySelectorAll(
-        '[aria-label*="Messenger"], [aria-label*="Chat"], [data-pagelet*="Chat"], [data-pagelet*="Messenger"]',
-      ));
-      for (const root of roots) {
-        for (const sel of selectors) {
-          const close = root.querySelector(sel);
-          if (close && typeof close.click === 'function') {
-            close.click();
-            return true;
-          }
-        }
-      }
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
-      return false;
-    }
-
-    const path = window.location && window.location.pathname ? window.location.pathname : '';
-    const hash = window.location && window.location.hash ? window.location.hash : '';
-    if (/^\\/messages(\\/|$)/.test(path) || /messages/i.test(hash)) {
-      window.location.assign('https://www.facebook.com/');
-      return { status: 'redirecting', feedFound: false };
-    }
-
-    dismissEmbeddedChatChrome();
-
-    const feed = document.querySelector('[role="main"] [role="feed"]')
-      || document.querySelector('[role="feed"]');
-    return { status: 'ready', feedFound: !!feed, path };
-  })()`;
+function describeSurface(surface) {
+  if (!surface) return 'no surface probe result';
+  const parts = [
+    `path=${surface.path || '?'}`,
+    `landmark=${surface.landmark || 'none'}`,
+    `roleFeed=${surface.feedFound ? 'yes' : 'no'}`,
+    `feedUnits=${surface.feedUnitCount ?? 0}`,
+    `postMenus=${surface.postMenuCount ?? 0}`,
+    `articles=${surface.articleCount ?? 0}`,
+    `chatChrome=${surface.chatChromeCount ?? (surface.messengerDom ? 'yes' : 0)}`,
+    `mainTextLength=${surface.mainTextLength ?? 0}`,
+    `visibility=${surface.visibilityState || '?'}`,
+    `readyState=${surface.readyState || '?'}`,
+  ];
+  if (Array.isArray(surface.dialogs) && surface.dialogs.length) parts.push(`dialogs=${JSON.stringify(surface.dialogs)}`);
+  if (Array.isArray(surface.pagelets) && surface.pagelets.length) parts.push(`pagelets=${surface.pagelets.join(',')}`);
+  return parts.join(' ');
 }
 
 function buildFeedExtractScript(limit) {
   return `(() => {
     const limit = ${limit};
-
-    function clean(value) {
-      // Strip zero-width / bidi control chars first: Facebook injects them into
-      // decoy nodes to poison scrapers. See issue #2089.
-      return String(value || '')
-        .replace(/[\\u034f\\u200b-\\u200f\\u202a-\\u202e\\u2060\\ufeff]/g, '')
-        .replace(/\\s+/g, ' ')
-        .trim();
-    }
+    ${FEED_DOM_HELPERS}
 
     // FB anti-scrape decoys: long spaceless digit runs, spaced single-char
     // strings ("a b c d e"), and hidden-domain .com spam. Real author/content
@@ -210,7 +326,7 @@ function buildFeedExtractScript(limit) {
     }
 
     function isPostActionLabel(label) {
-      return /^(Actions for this post(?: by .+)?|此帖子的操作|针对此帖子的操作|贴文的操作)$/i.test(label);
+      return POST_MENU_RE.test(label);
     }
 
     function isAuthPage() {
@@ -250,59 +366,35 @@ function buildFeedExtractScript(limit) {
         || /(?:·\\s*)?Shared with Public$/i.test(text);
     }
 
+    // Where to look for posts. role=feed when Facebook exposes it; otherwise
+    // role=main IF another landmark proves the feed column rendered. On
+    // facebook.com home with no landmark at all, refuse — role=main there also
+    // hosts docked chats and sidebars, which is exactly the bleed we saw live.
     function feedRoot() {
-      const path = window.location && window.location.pathname ? window.location.pathname : '';
-      const onHome = path === '' || path === '/';
-      const scoped = document.querySelector('[role="main"] [role="feed"]')
-        || document.querySelector('[role="feed"]');
+      const scoped = feedLandmarkEl();
       if (scoped) return scoped;
-      // facebook.com home embeds Messenger/chat columns in role=main. Never
-      // scrape outside an explicit [role=feed] landmark on the home surface.
-      if (onHome) return null;
-      const main = document.querySelector('[role="main"]');
+      const loc = locationInfo();
+      const main = mainEl();
+      if (loc.onHome) return feedLandmarkKind() ? main : null;
       return main || document.body;
     }
 
     function currentSurface() {
-      const path = window.location && window.location.pathname ? window.location.pathname : '';
-      const hash = window.location && window.location.hash ? window.location.hash : '';
-      const href = window.location && window.location.href ? window.location.href : '';
-      const onHome = path === '' || path === '/';
-      const isMessagesRoute = /^\\/messages(\\/|$)/.test(path)
-        || /\\/messages\\//i.test(hash)
-        || /\\/messages\\//i.test(href);
-      const feed = document.querySelector('[role="main"] [role="feed"]')
-        || document.querySelector('[role="feed"]');
-      const messengerDom = Boolean(
-        document.querySelector(
-          '[aria-label*="Messenger"], [aria-label*="Chat"], [aria-label*="Conversation"], '
-          + '[data-pagelet*="Chat"], [data-pagelet*="Messenger"], [data-testid*="message-thread"]',
-        )
-        || document.querySelector('a[href*="/messages/t/"], a[href*="/messages/e2ee/"]'),
-      );
+      const loc = locationInfo();
+      const landmark = feedLandmarkKind();
       return {
-        isMessagesRoute,
-        feedFound: Boolean(feed),
-        messengerDom,
-        onHome,
-        ready: !isMessagesRoute && Boolean(feed),
-        path,
+        isMessagesRoute: loc.isMessagesRoute,
+        feedFound: landmark === 'role-feed',
+        landmark,
+        messengerDom: chatChromeNodes().length > 0,
+        onHome: loc.onHome,
+        ready: !loc.isMessagesRoute && landmark !== null,
+        path: loc.path,
       };
     }
 
     function isInsideMessenger(node) {
-      for (let el = node; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
-        const aria = labelOf(el);
-        if (/^(Messenger|Chats|Chat|New message|Conversation|消息|聊天)$/i.test(aria)
-          || /\\b(Messenger|Chat|Conversation)\\b/i.test(aria)) return true;
-        const pagelet = el.getAttribute && el.getAttribute('data-pagelet') || '';
-        if (/chat|messenger/i.test(pagelet)) return true;
-        const testId = el.getAttribute && el.getAttribute('data-testid') || '';
-        if (/messenger|chat-tab|message-thread|mwchat/i.test(testId)) return true;
-        const role = el.getAttribute && el.getAttribute('role') || '';
-        if (role === 'complementary' && /message|chat|conversation/i.test(textOf(el))) return true;
-      }
-      return false;
+      return isInsideChatChrome(node) || isOutsideFeedColumn(node);
     }
 
     function isMessengerOrChatText(text) {
@@ -565,10 +657,7 @@ function buildFeedExtractScript(limit) {
     if (surface.isMessagesRoute) {
       return { status: 'wrong_surface', rows: [], diagnostics: { surface } };
     }
-    if (surface.onHome && !surface.feedFound) {
-      return { status: 'no_feed', rows: [], diagnostics: { surface } };
-    }
-    if (!surface.feedFound && surface.messengerDom) {
+    if (surface.onHome && !surface.landmark) {
       return { status: 'no_feed', rows: [], diagnostics: { surface } };
     }
 
@@ -603,16 +692,17 @@ function buildFeedExtractScript(limit) {
 // until enough post action-menus are present (or we stop growing). See #2089.
 async function loadFeedPosts(page, limit) {
   const scrollStep = `(async () => {
+    ${FEED_DOM_HELPERS}
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    const feed = document.querySelector('[role="main"] [role="feed"]')
-      || document.querySelector('[role="feed"]');
-    if (!feed) return 0;
-    feed.scrollTop = feed.scrollHeight;
+    const loc = locationInfo();
+    const root = feedLandmarkEl() || (feedLandmarkKind() ? mainEl() : null) || (loc.onHome ? null : mainEl());
+    if (!root) return 0;
+    // The home feed scrolls with the window; role=feed itself is not a scroll
+    // container. Nudge both so lazy posts stream in.
+    root.scrollTop = root.scrollHeight;
+    window.scrollTo(0, document.body.scrollHeight);
     await sleep(800);
-    return feed.querySelectorAll('[aria-label]').length
-      ? feed.querySelectorAll('[role="article"]').length
-        + Array.from(feed.querySelectorAll('[aria-label]')).filter((el) => /^(Actions for this post(?: by .+)?|此帖子的操作|针对此帖子的操作|贴文的操作)$/i.test((el.getAttribute('aria-label') || '').trim())).length
-      : 0;
+    return root.querySelectorAll('[role="article"]').length + postMenuEls().length + feedUnitEls().length;
   })()`;
   const extractStep = buildFeedExtractScript(limit);
   let prevMarkerCount = -1;
@@ -658,8 +748,9 @@ async function getFacebookFeed(page, kwargs) {
       );
     }
     throw new CommandExecutionError(
-      'facebook feed news-feed surface did not render',
-      `Surface diagnostics: path=${surface?.path || '?'}, feedFound=${surface?.feedFound ? 'yes' : 'no'}, messengerDom=${surface?.messengerDom ? 'yes' : 'no'}. The [role=feed] landmark must be present on facebook.com home.`,
+      `facebook feed news-feed surface did not render within ${Math.round(FEED_SURFACE_TIMEOUT_MS / 1000)}s`,
+      `Surface diagnostics: ${describeSurface(surface)}. No role=feed, FeedUnit pagelet, aria-posinset post, or "Actions for this post" menu was found on facebook.com home. `
+      + 'If pagelets list FeedUnit_n or visibility=hidden, report these diagnostics; otherwise retry with `--window foreground`.',
     );
   }
 
@@ -693,7 +784,7 @@ async function getFacebookFeed(page, kwargs) {
   if (payload.status === 'no_feed') {
     throw new CommandExecutionError(
       'facebook feed could not find the news-feed landmark on facebook.com home',
-      'Embedded Messenger/chat chrome may be covering the feed column. Dismiss chat UI in the browser and retry `opencli facebook feed`.',
+      `Surface diagnostics: ${describeSurface(payload.diagnostics && payload.diagnostics.surface)}. Docked chat/sidebar chrome is never scraped as posts; retry once the feed column is visible.`,
     );
   }
 
@@ -747,6 +838,7 @@ export const __test__ = {
   buildPrepareFeedScript,
   buildSurfaceCheckScript,
   command,
+  describeSurface,
   ensureNewsFeedSurface,
   feedNavigationUrl,
   getFacebookFeed,
@@ -754,5 +846,4 @@ export const __test__ = {
   readFeedSurface,
   requireLimit,
   rowLooksLikeMessengerBleed,
-  selectNonMessengerFacebookTab,
 };
