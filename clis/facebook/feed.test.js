@@ -1001,6 +1001,113 @@ describe('facebook feed', () => {
     expect(err.hint).toContain("Adolph L'héritage");
   });
 
+  it('promotes short role=article headers inside FeedUnit parents to extract real posts', () => {
+    const html = readFileSync(resolve(fixtureDir, '__fixtures__/feed-short-article-chrome.html'), 'utf8');
+    const payload = runExtract(html, 5, 'https://www.facebook.com/', { wrapFeed: false });
+
+    expect(payload.status).toBe('ok');
+    expect(payload.rows).toHaveLength(1);
+    expect(payload.rows[0].author).toBe('LVLUP with Lani');
+    expect(payload.rows[0].content).toContain('Readable post body');
+    expect(payload.diagnostics.rejections?.filter((r) => r.reason === 'too_short')).toHaveLength(2);
+    expect(payload.diagnostics.rejections?.every((r) => r.reason !== 'decoy_content' || r.author !== 'LVLUP with Lani')).toBe(true);
+  });
+
+  it('records textLength on too_short rejection samples', () => {
+    const payload = runExtract(`
+      <main role="main">
+        <div role="feed">
+          <div role="article"><span>Stories</span></div>
+        </div>
+      </main>
+    `, 5, 'https://www.facebook.com/', { wrapFeed: false });
+
+    const tooShort = payload.diagnostics.rejections?.find((r) => r.reason === 'too_short');
+    expect(tooShort).toBeDefined();
+    expect(tooShort.textLength).toBeLessThanOrEqual(30);
+    expect(__test__.describeFeedRejections(payload.diagnostics)).toMatch(/too_short\(len=/);
+  });
+
+  it('keeps scrolling when only chrome stubs and decoys are visible but main text is substantial', async () => {
+    const hydrationGap = {
+      status: 'no_rows',
+      rows: [],
+      diagnostics: {
+        articleCount: 2,
+        actionMenuCount: 1,
+        mainTextLength: 972,
+        rejections: [
+          { reason: 'too_short', textLength: 7, snippet: 'Stories' },
+          { reason: 'too_short', textLength: 11, snippet: 'Create post' },
+          { reason: 'decoy_content', author: "Adolph L'héritage", snippet: 'Mk7sPrtt9B23f81' },
+        ],
+      },
+    };
+    const hydrated = {
+      status: 'ok',
+      rows: [{ index: 1, author: 'LVLUP with Lani', content: 'Readable post body', likes: '8', comments: '-', shares: '-' }],
+      diagnostics: { articleCount: 3, mainTextLength: 1200, rejections: [] },
+    };
+
+    let extractCalls = 0;
+    const page = {
+      evaluate: vi.fn().mockImplementation((script) => {
+        const source = String(script);
+        if (source.includes('scrollBy') || source.includes('scrollTop')) return Promise.resolve(4);
+        if (source.includes('primaryContainers')) {
+          extractCalls += 1;
+          return Promise.resolve(extractCalls < 4 ? hydrationGap : hydrated);
+        }
+        return Promise.resolve(0);
+      }),
+    };
+
+    await __test__.loadFeedPosts(page, 1);
+    expect(extractCalls).toBeGreaterThanOrEqual(4);
+  });
+
+  it('needsMoreFeedHydration when too_short chrome coexists with substantial main text', () => {
+    expect(__test__.needsMoreFeedHydration({
+      status: 'no_rows',
+      rows: [],
+      diagnostics: {
+        mainTextLength: 972,
+        actionMenuCount: 1,
+        rejections: [{ reason: 'too_short', textLength: 7 }, { reason: 'decoy_content' }],
+      },
+    })).toBe(true);
+    expect(__test__.needsMoreFeedHydration({
+      status: 'ok',
+      rows: [{ index: 1, author: 'A', content: 'Body', likes: '-', comments: '-', shares: '-' }],
+      diagnostics: { mainTextLength: 972, rejections: [{ reason: 'too_short' }] },
+    })).toBe(false);
+  });
+
+  it('maps live-like too_short chrome plus decoy to anti-scrape error with stub lengths', async () => {
+    const page = createPage({
+      status: 'no_rows',
+      rows: [],
+      diagnostics: {
+        articleCount: 2,
+        actionMenuCount: 1,
+        fallbackActionCount: 1,
+        mainTextLength: 972,
+        rejections: [
+          { reason: 'too_short', textLength: 7, snippet: 'Stories' },
+          { reason: 'too_short', textLength: 11, snippet: 'Create post' },
+          { reason: 'decoy_content', author: "Adolph L'héritage", snippet: 'Mk7sPrtt9B23f81' },
+        ],
+      },
+    });
+
+    const err = await __test__.command.func(page, { limit: 5 }).catch((e) => e);
+    expect(err).toBeInstanceOf(CommandExecutionError);
+    expect(err.message).toMatch(/anti-scrape decoy/i);
+    expect(err.hint).toMatch(/chrome stub/i);
+    expect(err.hint).toMatch(/too_short\(len=7\)/);
+    expect(err.hint).toContain("Adolph L'héritage");
+  });
+
   it('includes rejection breakdown when articles exist but nothing extracts', async () => {
     const page = createPage({
       status: 'no_rows',
