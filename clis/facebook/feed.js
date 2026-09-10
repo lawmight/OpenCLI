@@ -39,6 +39,75 @@ function rowLooksLikeMessengerBleed(row) {
   return true;
 }
 
+function cleanFeedText(value) {
+  return String(value || '')
+    .replace(/[\u034f\u200b-\u200f\u202a-\u202e\u2060\ufeff]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Keep in sync with FEED_DECOY_HELPERS embedded in buildFeedExtractScript.
+function isDecoyFeedText(text) {
+  if (!text) return true;
+  if (/^\d{8,}$/.test(text)) return true;
+  if (/^(?:\S ){4,}\S$/.test(text) && text.replace(/\s/g, '').length <= 12) return true;
+  if (/^[a-z0-9]{6,}\.(com|net|org)$/i.test(text)) return true;
+  if (/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[a-z0-9_-]{16,}$/i.test(text)) return true;
+  return false;
+}
+
+function isScrambledFeedText(text) {
+  const t = cleanFeedText(text);
+  if (!t) return true;
+  if (isDecoyFeedText(t)) return true;
+  if (t.length < 12) return false;
+
+  if (/^[A-Za-z0-9]{10,}:\s/.test(t)) return true;
+
+  const tokens = t.split(/\s+/).filter((word) => word.length > 1);
+  if (tokens.length === 0) return true;
+
+  let scrambled = 0;
+  for (const word of tokens) {
+    const core = word.replace(/[^\w]/g, '');
+    if (!core) continue;
+    if (/\d/.test(core) && /[a-zA-Z]/.test(core) && !/^(19|20)\d{2}$/.test(core)) {
+      if (/[a-zA-Z]\d|\d[a-zA-Z]/.test(core) || /(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/.test(core)) {
+        scrambled += 1;
+        continue;
+      }
+    }
+    if (/^[a-z]+[A-Z][a-z]*[A-Z]/.test(core)) {
+      scrambled += 1;
+      continue;
+    }
+    if (/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[a-zA-Z0-9]{8,}$/.test(core)) {
+      scrambled += 1;
+    }
+  }
+
+  if (tokens.length >= 2 && scrambled / tokens.length >= 0.25) return true;
+  if (scrambled >= 2 && scrambled / tokens.length >= 0.15) return true;
+
+  const letters = t.replace(/[^a-zA-ZàâäéèêëïîôùûüœæÀÂÄÉÈÊËÏÎÔÙÛÜŒÆ]/g, '');
+  if (letters.length >= 24) {
+    const vowels = (letters.match(/[aeiouAEIOUàâäéèêëïîôùûüœæ]/g) || []).length;
+    if (vowels / letters.length < 0.18) return true;
+  }
+
+  return false;
+}
+
+function rowLooksLikeDecoyPost(row) {
+  if (!row) return false;
+  const content = cleanFeedText(row.content);
+  if (!content) return true;
+  if (isScrambledFeedText(content)) return true;
+  const author = cleanFeedText(row.author);
+  if (author && isDecoyFeedText(author)) return true;
+  return false;
+}
+
 // Shared by the surface probe and the extractor so both agree on what counts
 // as "the news feed" and what counts as chat chrome. Keep in sync.
 const FEED_DOM_HELPERS = `
@@ -118,6 +187,52 @@ const FEED_DOM_HELPERS = `
         || /\\/messages\\//i.test(hash)
         || /\\/messages\\//i.test(href);
       return { path, hash, href, isMessagesRoute, onHome: path === '' || path === '/' };
+    }
+    // FB anti-scrape decoys: long digit runs, spaced single-char strings,
+    // hidden-domain spam, opaque tokens, and scrambled alphanumeric soup.
+    // Real author/content text never looks like this.
+    function isDecoyText(text) {
+      if (!text) return true;
+      if (/^\\d{8,}$/.test(text)) return true;
+      if (/^(?:\\S ){4,}\\S$/.test(text) && text.replace(/\\s/g, '').length <= 12) return true;
+      if (/^[a-z0-9]{6,}\\.(com|net|org)$/i.test(text)) return true;
+      if (/^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)[a-z0-9_-]{16,}$/i.test(text)) return true;
+      return false;
+    }
+    function isScrambledOrGarbledText(text) {
+      const t = clean(text);
+      if (!t) return true;
+      if (isDecoyText(t)) return true;
+      if (t.length < 12) return false;
+      if (/^[A-Za-z0-9]{10,}:\\s/.test(t)) return true;
+      const tokens = t.split(/\\s+/).filter((word) => word.length > 1);
+      if (tokens.length === 0) return true;
+      let scrambled = 0;
+      for (const word of tokens) {
+        const core = word.replace(/[^\\w]/g, '');
+        if (!core) continue;
+        if (/\\d/.test(core) && /[a-zA-Z]/.test(core) && !/^(19|20)\\d{2}$/.test(core)) {
+          if (/[a-zA-Z]\\d|\\d[a-zA-Z]/.test(core) || /(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)/.test(core)) {
+            scrambled += 1;
+            continue;
+          }
+        }
+        if (/^[a-z]+[A-Z][a-z]*[A-Z]/.test(core)) {
+          scrambled += 1;
+          continue;
+        }
+        if (/^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)[a-zA-Z0-9]{8,}$/.test(core)) {
+          scrambled += 1;
+        }
+      }
+      if (tokens.length >= 2 && scrambled / tokens.length >= 0.25) return true;
+      if (scrambled >= 2 && scrambled / tokens.length >= 0.15) return true;
+      const letters = t.replace(/[^a-zA-ZàâäéèêëïîôùûüœæÀÂÄÉÈÊËÏÎÔÙÛÜŒÆ]/g, '');
+      if (letters.length >= 24) {
+        const vowels = (letters.match(/[aeiouAEIOUàâäéèêëïîôùûüœæ]/g) || []).length;
+        if (vowels / letters.length < 0.18) return true;
+      }
+      return false;
     }
 `;
 
@@ -300,18 +415,6 @@ function buildFeedExtractScript(limit) {
   return `(() => {
     const limit = ${limit};
     ${FEED_DOM_HELPERS}
-
-    // FB anti-scrape decoys: long spaceless digit runs, spaced single-char
-    // strings ("a b c d e"), and hidden-domain .com spam. Real author/content
-    // text never looks like this.
-    function isDecoyText(text) {
-      if (!text) return true;
-      if (/^\\d{8,}$/.test(text)) return true;
-      if (/^(?:\\S ){4,}\\S$/.test(text) && text.replace(/\\s/g, '').length <= 12) return true;
-      if (/^[a-z0-9]{6,}\\.(com|net|org)$/i.test(text)) return true;
-      if (/^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)[a-z0-9_-]{24,}$/i.test(text)) return true;
-      return false;
-    }
 
     function isReelsOrCarouselChrome(text) {
       return /^(Reels|Reels and short videos|Reels 和短视频|快拍|短视频|People you may know)/i.test(text);
@@ -499,7 +602,7 @@ function buildFeedExtractScript(limit) {
         if (text.length <= 10) return false;
         if (isSuggestionOrChrome(text) || isSponsored(text)) return false;
         if (isActionText(text) || isMetricText(text) || isTimestampText(text)) return false;
-        if (isDecoyText(text) || isReelsOrCarouselChrome(text)) return false;
+        if (isDecoyText(text) || isScrambledOrGarbledText(text) || isReelsOrCarouselChrome(text)) return false;
         if (isMessengerOrChatText(text)) return false;
         if (/^(See more|查看更多|更多)$/i.test(text)) return false;
         return true;
@@ -526,6 +629,8 @@ function buildFeedExtractScript(limit) {
       if (onHome && !author && !postUrl && !hasPostMenu) return null;
       if (!author && isMessengerOrChatText(content)) return null;
       if (isMessengerOrChatText(content)) return null;
+      if (isScrambledOrGarbledText(content)) return null;
+      if (author && isDecoyText(author)) return null;
 
       const likesMatch = fullText.match(/所有心情：\\s*(\\d[\\d,.\\s万亿KMk]*)/)
         || fullText.match(/All:\\s*(\\d[\\d,.KMk]*)/)
@@ -790,14 +895,24 @@ async function getFacebookFeed(page, kwargs) {
 
   if (payload.rows.length > 0) {
     const messengerRows = payload.rows.filter((row) => rowLooksLikeMessengerBleed(row));
-    if (messengerRows.length === payload.rows.length) {
+    const decoyRows = payload.rows.filter((row) => rowLooksLikeDecoyPost(row));
+    const readableRows = payload.rows.filter((row) => !rowLooksLikeMessengerBleed(row) && !rowLooksLikeDecoyPost(row));
+
+    if (readableRows.length === 0 && decoyRows.length === payload.rows.length) {
+      const sampleAuthor = decoyRows[0]?.author || '(no author)';
+      throw new CommandExecutionError(
+        'facebook feed rows look like anti-scrape decoy posts instead of readable news-feed content',
+        `All ${decoyRows.length} extracted row(s) failed readability checks (e.g. author="${sampleAuthor}"). `
+        + 'Facebook may be serving poisoned feed markup — retry `opencli facebook feed` once the home news feed shows real posts.',
+      );
+    }
+    if (readableRows.length === 0 && messengerRows.length === payload.rows.length) {
       throw new CommandExecutionError(
         'facebook feed rows look like embedded Messenger/chat UI instead of news-feed posts',
         'Dismiss embedded chat chrome on facebook.com home and retry `opencli facebook feed`.',
       );
     }
-    const cleaned = payload.rows.filter((row) => !rowLooksLikeMessengerBleed(row));
-    if (cleaned.length > 0) return cleaned.slice(0, limit);
+    if (readableRows.length > 0) return readableRows.slice(0, limit);
   }
 
   if (payload.status === 'empty') {
@@ -846,4 +961,7 @@ export const __test__ = {
   readFeedSurface,
   requireLimit,
   rowLooksLikeMessengerBleed,
+  rowLooksLikeDecoyPost,
+  isDecoyFeedText,
+  isScrambledFeedText,
 };

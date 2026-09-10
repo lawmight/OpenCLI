@@ -871,4 +871,100 @@ describe('facebook feed', () => {
       shares: '-',
     }]);
   });
+
+  it('rejects Adolph-style decoy posts with plausible authors but scrambled content', () => {
+    const html = readFileSync(resolve(fixtureDir, '__fixtures__/feed-adolph-decoy.html'), 'utf8');
+    const payload = runExtract(html, 5, 'https://www.facebook.com/', { wrapFeed: false });
+
+    expect(payload.status).toBe('ok');
+    expect(payload.rows).toHaveLength(1);
+    expect(payload.rows[0].author).toBe('LVLUP with Lani');
+    expect(payload.rows[0].content).toContain('readable text');
+    expect(payload.rows.map((r) => r.author)).not.toContain("Adolph L'héritage");
+  });
+
+  it('returns no rows when only scrambled decoy posts are visible', () => {
+    const payload = runExtract(`
+      <main role="main">
+        <div>
+          <h3><a role="link" href="https://www.facebook.com/decoy">Adolph L'héritage</a></h3>
+          <div dir="auto">Mk7sPrtt9B23f81: 601aut22gi350s 9liui64P2u1cf 462Mf3618t · Shared with Public</div>
+          <div dir="auto">onspeodSrtt5A12f71 wrd5cram bl3d t3xt th4t sh0uld n3v3r p4ss readab1lity checks.</div>
+          <button aria-label="Actions for this post by Adolph L'héritage"></button>
+        </div>
+      </main>
+    `, 5);
+
+    expect(payload.status).toBe('no_rows');
+    expect(payload.rows).toEqual([]);
+  });
+
+  it('flags scrambled decoy rows via rowLooksLikeDecoyPost', () => {
+    expect(__test__.rowLooksLikeDecoyPost({
+      author: "Adolph L'héritage",
+      content: 'Mk7sPrtt9B23f81: 601aut22gi350s 9liui64P2u1cf 462Mf3618t',
+      likes: '-',
+      comments: '-',
+      shares: '-',
+    })).toBe(true);
+    expect(__test__.rowLooksLikeDecoyPost({
+      author: 'LVLUP with Lani',
+      content: 'Real news-feed post body with enough readable text to extract.',
+      likes: '12',
+      comments: '3',
+      shares: '-',
+    })).toBe(false);
+  });
+
+  it('maps decoy-only extraction payloads to a typed anti-scrape error', async () => {
+    const page = createPage({
+      status: 'ok',
+      rows: [{
+        index: 1,
+        author: "Adolph L'héritage",
+        content: 'Mk7sPrtt9B23f81: 601aut22gi350s 9liui64P2u1cf 462Mf3618t',
+        likes: '-',
+        comments: '-',
+        shares: '-',
+      }],
+    });
+
+    await expect(__test__.command.func(page, { limit: 1 }))
+      .rejects.toBeInstanceOf(CommandExecutionError);
+    await expect(__test__.command.func(page, { limit: 1 }))
+      .rejects.toThrow(/anti-scrape decoy|decoy/i);
+  });
+
+  it('filters decoy rows but keeps readable feed rows when mixed', async () => {
+    const page = createPage({
+      status: 'ok',
+      rows: [
+        {
+          index: 1,
+          author: "Adolph L'héritage",
+          content: 'Mk7sPrtt9B23f81: 601aut22gi350s scrambled junk',
+          likes: '-',
+          comments: '-',
+          shares: '-',
+        },
+        {
+          index: 2,
+          author: 'LVLUP with Lani',
+          content: 'Readable feed post body with real content.',
+          likes: '5',
+          comments: '-',
+          shares: '-',
+        },
+      ],
+    });
+
+    await expect(__test__.command.func(page, { limit: 2 })).resolves.toEqual([{
+      index: 2,
+      author: 'LVLUP with Lani',
+      content: 'Readable feed post body with real content.',
+      likes: '5',
+      comments: '-',
+      shares: '-',
+    }]);
+  });
 });
