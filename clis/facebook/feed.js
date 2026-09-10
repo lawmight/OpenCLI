@@ -69,7 +69,7 @@ function isScrambledFeedText(text) {
 
   let scrambled = 0;
   for (const word of tokens) {
-    const core = word.replace(/[^\w]/g, '');
+    const core = word.replace(/[^a-zA-ZàâäéèêëïîôùûüœæÀÂÄÉÈÊËÏÎÔÙÛÜŒÆ0-9_]/g, '');
     if (!core) continue;
     if (/\d/.test(core) && /[a-zA-Z]/.test(core) && !/^(19|20)\d{2}$/.test(core)) {
       if (/[a-zA-Z]\d|\d[a-zA-Z]/.test(core) || /(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/.test(core)) {
@@ -108,10 +108,42 @@ function rowLooksLikeDecoyPost(row) {
   return false;
 }
 
+function summarizeFeedRejections(diagnostics) {
+  const rejections = Array.isArray(diagnostics?.rejections) ? diagnostics.rejections : [];
+  const counts = {};
+  for (const entry of rejections) {
+    const reason = entry?.reason || 'unknown';
+    counts[reason] = (counts[reason] || 0) + 1;
+  }
+  const decoyCount = (counts.decoy_author || 0) + (counts.decoy_content || 0);
+  const samples = rejections.slice(0, 3).map((entry) => {
+    const author = entry?.author ? ` author="${entry.author}"` : '';
+    return `${entry?.reason || 'unknown'}${author}`;
+  });
+  return {
+    rejections,
+    counts,
+    decoyCount,
+    allDecoy: rejections.length > 0 && decoyCount === rejections.length,
+    samples,
+  };
+}
+
+function describeFeedRejections(diagnostics) {
+  const { rejections, counts, samples } = summarizeFeedRejections(diagnostics);
+  if (rejections.length === 0) return '';
+  const parts = [`rejected=${rejections.length}`];
+  for (const [reason, count] of Object.entries(counts)) {
+    parts.push(`${reason}=${count}`);
+  }
+  if (samples.length > 0) parts.push(`samples=${samples.join('; ')}`);
+  return parts.join(', ');
+}
+
 // Shared by the surface probe and the extractor so both agree on what counts
 // as "the news feed" and what counts as chat chrome. Keep in sync.
 const FEED_DOM_HELPERS = `
-    const POST_MENU_RE = /^(Actions for this post(?: by .+)?|Actions pour cette publication|此帖子的操作|针对此帖子的操作|贴文的操作)$/i;
+    const POST_MENU_RE = /^(Actions for this post(?: by .+)?|Actions pour cette publication(?: par .+)?|此帖子的操作|针对此帖子的操作|贴文的操作)$/i;
     const OUTSIDE_FEED_ROLES = new Set(['banner', 'navigation', 'complementary', 'contentinfo']);
     function clean(value) {
       return String(value || '')
@@ -209,7 +241,7 @@ const FEED_DOM_HELPERS = `
       if (tokens.length === 0) return true;
       let scrambled = 0;
       for (const word of tokens) {
-        const core = word.replace(/[^\\w]/g, '');
+        const core = word.replace(/[^a-zA-ZàâäéèêëïîôùûüœæÀÂÄÉÈÊËÏÎÔÙÛÜŒÆ0-9_]/g, '');
         if (!core) continue;
         if (/\\d/.test(core) && /[a-zA-Z]/.test(core) && !/^(19|20)\\d{2}$/.test(core)) {
           if (/[a-zA-Z]\\d|\\d[a-zA-Z]/.test(core) || /(?=.*[a-z])(?=.*[A-Z])(?=.*\\d)/.test(core)) {
@@ -455,18 +487,18 @@ function buildFeedExtractScript(limit) {
     }
 
     function isActionText(text) {
-      return /^(Like|Comment|Share|Send|Follow|赞|评论|分享|发送|关注)$/i.test(text);
+      return /^(Like|Comment|Share|Send|Follow|赞|评论|分享|发送|关注|J'aime|Commenter|Partager|Envoyer|Suivre)$/i.test(text);
     }
 
     function isMetricText(text) {
-      return /^(All:|所有心情：)/i.test(text)
-        || /\\b(likes?|reactions?|comments?|shares?)\\b/i.test(text)
+      return /^(All:|Tous\\s*:|Toutes les réactions\\s*:|所有心情：)/i.test(text)
+        || /\\b(likes?|reactions?|comments?|shares?|commentaires?|partages?|réactions?)\\b/i.test(text)
         || /(条评论|次分享)$/.test(text);
     }
 
     function isTimestampText(text) {
-      return /^(\\d+\\s*(s|m|h|d|w|mo|yr|min|sec|second|minute|hour|day|week|month|year)s?|Just now|Yesterday|刚刚|昨天|\\d+小时|\\d+天)(\\s*[·•.])?$/i.test(text)
-        || /(?:·\\s*)?Shared with Public$/i.test(text);
+      return /^(\\d+\\s*(s|m|h|d|w|mo|yr|min|sec|second|minute|hour|day|week|month|year)s?|Just now|Yesterday|Il y a \\d+|À l'instant|Hier|刚刚|昨天|\\d+小时|\\d+天)(\\s*[·•.])?$/i.test(text)
+        || /(?:·\\s*)?(Shared with Public|Partagé avec Public|Partagé avec le public)$/i.test(text);
     }
 
     // Where to look for posts. role=feed when Facebook exposes it; otherwise
@@ -548,9 +580,9 @@ function buildFeedExtractScript(limit) {
       const kinds = new Set();
       for (const el of root.querySelectorAll('[aria-label]')) {
         const label = labelOf(el);
-        if (/^(Like|赞)$/i.test(label)) kinds.add('like');
-        if (/^(Comment|评论)$/i.test(label)) kinds.add('comment');
-        if (/^(Share|分享)$/i.test(label)) kinds.add('share');
+        if (/^(Like|赞|J'aime)$/i.test(label)) kinds.add('like');
+        if (/^(Comment|评论|Commenter)$/i.test(label)) kinds.add('comment');
+        if (/^(Share|分享|Partager)$/i.test(label)) kinds.add('share');
       }
       return kinds;
     }
@@ -568,7 +600,9 @@ function buildFeedExtractScript(limit) {
 
     function findAuthor(root) {
       for (const el of root.querySelectorAll('[aria-label]')) {
-        const match = labelOf(el).match(/^Actions for this post by (.+)$/i);
+        const label = labelOf(el);
+        const match = label.match(/^Actions for this post by (.+)$/i)
+          || label.match(/^Actions pour cette publication par (.+)$/i);
         if (match) {
           const text = clean(match[1]);
           if (text.length > 1 && text.length <= 80 && !isDecoyText(text)) return text;
@@ -609,6 +643,47 @@ function buildFeedExtractScript(limit) {
       });
     }
 
+    function hasFilteredScrambledContent(root, author) {
+      return visibleBlocks(root).some((text) => {
+        if (text === author || text.length <= 10) return false;
+        return isDecoyText(text) || isScrambledOrGarbledText(text);
+      });
+    }
+
+    function rejectionReason(root) {
+      const fullText = textOf(root);
+      if (!fullText) return 'empty';
+      if (isSuggestionOrChrome(fullText) || isSponsored(fullText)) return 'suggestion';
+      if (isMessengerContainer(root)) return 'messenger';
+      const author = findAuthor(root);
+      const blocks = contentBlocks(root, author);
+      const content = clean(blocks.join(' '));
+      const postUrl = postUrlFrom(root);
+      const kinds = actionKinds(root);
+      const hasPostMenu = Array.from(root.querySelectorAll('[aria-label]'))
+        .some((el) => isPostActionLabel(labelOf(el)));
+      const path = window.location && window.location.pathname ? window.location.pathname : '';
+      const onHome = path === '' || path === '/';
+      if (author && isDecoyText(author)) return 'decoy_author';
+      if ((content && isScrambledOrGarbledText(content)) || hasFilteredScrambledContent(root, author)) return 'decoy_content';
+      if (!author && !content) return 'no_author_content';
+      if (!content && !postUrl && kinds.size < 2) return 'insufficient_evidence';
+      if (onHome && !author && !postUrl && !hasPostMenu) return 'no_home_evidence';
+      if (!author && isMessengerOrChatText(content)) return 'messenger_text';
+      if (isMessengerOrChatText(content)) return 'messenger_text';
+      return 'unknown';
+    }
+
+    function rejectionSample(root) {
+      const author = findAuthor(root);
+      const content = clean(contentBlocks(root, author).join(' '));
+      return {
+        reason: rejectionReason(root),
+        author: author.substring(0, 40),
+        snippet: (content || textOf(root)).substring(0, 80),
+      };
+    }
+
     function extractPost(root, index) {
       const fullText = textOf(root);
       if (!fullText || isSuggestionOrChrome(fullText) || isSponsored(fullText)) return null;
@@ -633,12 +708,12 @@ function buildFeedExtractScript(limit) {
       if (author && isDecoyText(author)) return null;
 
       const likesMatch = fullText.match(/所有心情：\\s*(\\d[\\d,.\\s万亿KMk]*)/)
-        || fullText.match(/All:\\s*(\\d[\\d,.KMk]*)/)
-        || fullText.match(/(\\d[\\d,.KMk]*)\\s*(?:likes?|reactions?)/i);
+        || fullText.match(/(?:All|Tous)\\s*:\\s*(\\d[\\d,.KMk]*)/i)
+        || fullText.match(/(\\d[\\d,.KMk]*)\\s*(?:likes?|reactions?|réactions?)/i);
       const commentsMatch = fullText.match(/([\\d,.]+\\s*[万亿]?)\\s*条评论/)
-        || fullText.match(/(\\d[\\d,.KMk]*)\\s*comments?/i);
+        || fullText.match(/(\\d[\\d,.KMk]*)\\s*(?:comments?|commentaires?)/i);
       const sharesMatch = fullText.match(/([\\d,.]+\\s*[万亿]?)\\s*次分享/)
-        || fullText.match(/(\\d[\\d,.KMk]*)\\s*shares?/i);
+        || fullText.match(/(\\d[\\d,.KMk]*)\\s*(?:shares?|partages?)/i);
 
       return {
         index,
@@ -722,7 +797,11 @@ function buildFeedExtractScript(limit) {
     function fallbackContainers() {
       const main = feedRoot();
       if (!main) return [];
-      const buttons = Array.from(main.querySelectorAll('[aria-label="Like"], [aria-label="赞"], [aria-label="Comment"], [aria-label="评论"], [aria-label="Share"], [aria-label="分享"]'));
+      const buttons = Array.from(main.querySelectorAll(
+        '[aria-label="Like"], [aria-label="赞"], [aria-label="J\\'aime"], '
+        + '[aria-label="Comment"], [aria-label="评论"], [aria-label="Commenter"], '
+        + '[aria-label="Share"], [aria-label="分享"], [aria-label="Partager"]',
+      ));
       const seen = new WeakSet();
       const containers = [];
       for (const button of buttons) {
@@ -748,8 +827,12 @@ function buildFeedExtractScript(limit) {
       const seen = new Set();
       const result = [];
       for (const node of containers) {
-        const key = postUrlFrom(node) || contentBlocks(node, findAuthor(node)).join('|').substring(0, 200);
-        if (!key || seen.has(key)) continue;
+        const author = findAuthor(node);
+        const key = postUrlFrom(node)
+          || contentBlocks(node, author).join('|').substring(0, 200)
+          || (author ? ('author:' + author) : '')
+          || ('text:' + textOf(node).substring(0, 120));
+        if (seen.has(key)) continue;
         seen.add(key);
         result.push(node);
       }
@@ -766,13 +849,40 @@ function buildFeedExtractScript(limit) {
       return { status: 'no_feed', rows: [], diagnostics: { surface } };
     }
 
+    function primaryRejectionReason(el) {
+      if (!withinFeedScope(el)) return 'out_of_scope';
+      if (textOf(el).length <= 30) return 'too_short';
+      const hasCommentScopedLink = Boolean(el.querySelector('a[href*="comment_id="]'));
+      const hasPostMenu = Array.from(el.querySelectorAll('[aria-label]'))
+        .some((node) => isPostActionLabel(labelOf(node)));
+      if (hasCommentScopedLink && !hasPostMenu) return 'comment_thread';
+      return null;
+    }
+
     const primary = primaryContainers();
     const actionAnchored = actionAnchoredContainers();
     const combined = dedupe([...primary, ...actionAnchored, ...fallbackContainers()]);
+    const primarySet = new Set(primary);
+    const rejections = [];
+    const feedRootEl = feedRoot();
+    if (feedRootEl) {
+      for (const el of Array.from(feedRootEl.querySelectorAll('[role="article"]'))) {
+        if (primarySet.has(el)) continue;
+        const reason = primaryRejectionReason(el);
+        if (reason) {
+          const sample = rejectionSample(el);
+          rejections.push({ ...sample, reason });
+        }
+      }
+    }
     const rows = [];
     for (const container of combined) {
       const row = extractPost(container, rows.length + 1);
-      if (row) rows.push(row);
+      if (row) {
+        rows.push(row);
+      } else {
+        rejections.push(rejectionSample(container));
+      }
       if (rows.length >= limit) break;
     }
 
@@ -783,9 +893,13 @@ function buildFeedExtractScript(limit) {
         articleCount: document.querySelectorAll('[role="article"]').length,
         primaryCount: primary.length,
         actionMenuCount: actionMenuAnchors().length,
-        fallbackActionCount: document.querySelectorAll('[role="main"] [aria-label="Like"], [role="main"] [aria-label="赞"], [role="main"] [aria-label="Comment"], [role="main"] [aria-label="评论"]').length,
+        fallbackActionCount: document.querySelectorAll(
+          '[role="main"] [aria-label="Like"], [role="main"] [aria-label="赞"], [role="main"] [aria-label="J\\'aime"], '
+          + '[role="main"] [aria-label="Comment"], [role="main"] [aria-label="评论"], [role="main"] [aria-label="Commenter"]',
+        ).length,
         mainTextLength: textOf(document.querySelector('[role="main"]')).length,
         feedFound: !!document.querySelector('[role="main"] [role="feed"], [role="feed"]'),
+        rejections: rejections.slice(0, 12),
         surface,
       },
     };
@@ -920,10 +1034,24 @@ async function getFacebookFeed(page, kwargs) {
   }
 
   const diagnostics = payload.diagnostics || {};
+  const rejectionSummary = summarizeFeedRejections(diagnostics);
+  const rejectionDetails = describeFeedRejections(diagnostics);
+  const baseDiagnostics = `articles=${diagnostics.articleCount || 0}, actions=${diagnostics.fallbackActionCount || 0}, mainTextLength=${diagnostics.mainTextLength || 0}`;
+
+  if (rejectionSummary.allDecoy) {
+    const sampleAuthor = rejectionSummary.rejections[0]?.author || '(no author)';
+    throw new CommandExecutionError(
+      'facebook feed rows look like anti-scrape decoy posts instead of readable news-feed content',
+      `All ${rejectionSummary.rejections.length} candidate article(s) failed readability checks (e.g. author="${sampleAuthor}"). `
+      + `Diagnostics: ${baseDiagnostics}${rejectionDetails ? `, ${rejectionDetails}` : ''}. `
+      + 'Facebook may be serving poisoned feed markup — retry `opencli facebook feed` once the home news feed shows real posts.',
+    );
+  }
+
   if (diagnostics.articleCount || diagnostics.actionMenuCount || diagnostics.fallbackActionCount || diagnostics.mainTextLength > 200) {
     throw new CommandExecutionError(
       'facebook feed page rendered but no feed rows could be extracted',
-      `Diagnostics: articles=${diagnostics.articleCount || 0}, actions=${diagnostics.fallbackActionCount || 0}, mainTextLength=${diagnostics.mainTextLength || 0}.`,
+      `Diagnostics: ${baseDiagnostics}${rejectionDetails ? `, ${rejectionDetails}` : ''}.`,
     );
   }
 
@@ -964,4 +1092,6 @@ export const __test__ = {
   rowLooksLikeDecoyPost,
   isDecoyFeedText,
   isScrambledFeedText,
+  summarizeFeedRejections,
+  describeFeedRejections,
 };
