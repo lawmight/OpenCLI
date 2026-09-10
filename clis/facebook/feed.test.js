@@ -935,6 +935,95 @@ describe('facebook feed', () => {
       .rejects.toThrow(/anti-scrape decoy|decoy/i);
   });
 
+  it('extracts French-locale feed posts with apostrophe author names', () => {
+    const html = readFileSync(resolve(fixtureDir, '__fixtures__/feed-french-post.html'), 'utf8');
+    const payload = runExtract(html, 5, 'https://www.facebook.com/', { wrapFeed: false });
+
+    expect(payload.status).toBe('ok');
+    expect(payload.rows).toHaveLength(1);
+    expect(payload.rows[0].author).toBe('LVLUP with Lani');
+    expect(payload.rows[0].content).toContain("l'extraction");
+    expect(payload.rows[0].likes).toBe('12');
+    expect(payload.rows[0].comments).toBe('3');
+  });
+
+  it('keeps readable French prose with apostrophes out of decoy filters', () => {
+    expect(__test__.rowLooksLikeDecoyPost({
+      author: "Marie L'héritage",
+      content: "Voici une publication normale sur l'héritage familial et notre communauté cette semaine.",
+      likes: '4',
+      comments: '-',
+      shares: '-',
+    })).toBe(false);
+  });
+
+  it('records decoy rejection diagnostics when only scrambled articles are visible', () => {
+    const payload = runExtract(`
+      <main role="main">
+        <div role="feed">
+          <div role="article">
+            <h3><a role="link" href="https://www.facebook.com/decoy">Adolph L'héritage</a></h3>
+            <div dir="auto">Mk7sPrtt9B23f81: 601aut22gi350s 9liui64P2u1cf 462Mf3618t · Partagé avec Public</div>
+            <div dir="auto">onspeodSrtt5A12f71 wrd5cram bl3d t3xt th4t sh0uld n3v3r p4ss readab1lity checks.</div>
+            <button aria-label="Actions pour cette publication par Adolph L'héritage"></button>
+            <button aria-label="J'aime"></button>
+            <button aria-label="Commenter"></button>
+          </div>
+        </div>
+      </main>
+    `, 5, 'https://www.facebook.com/', { wrapFeed: false });
+
+    expect(payload.status).toBe('no_rows');
+    expect(payload.rows).toEqual([]);
+    expect(payload.diagnostics.rejections?.length).toBeGreaterThan(0);
+    expect(payload.diagnostics.rejections.some((r) => r.reason === 'decoy_content')).toBe(true);
+  });
+
+  it('maps no_rows with all-decoy rejections to anti-scrape error with diagnostics', async () => {
+    const page = createPage({
+      status: 'no_rows',
+      rows: [],
+      diagnostics: {
+        articleCount: 2,
+        fallbackActionCount: 1,
+        mainTextLength: 976,
+        rejections: [
+          { reason: 'decoy_content', author: "Adolph L'héritage", snippet: 'Mk7sPrtt9B23f81: 601aut22gi350s' },
+          { reason: 'decoy_content', author: "Adolph L'héritage", snippet: 'onspeodSrtt5A12f71 wrd5cram' },
+        ],
+      },
+    });
+
+    const err = await __test__.command.func(page, { limit: 5 }).catch((e) => e);
+    expect(err).toBeInstanceOf(CommandExecutionError);
+    expect(err.message).toMatch(/anti-scrape decoy/i);
+    expect(err.hint).toMatch(/decoy_content=2/);
+    expect(err.hint).toContain("Adolph L'héritage");
+  });
+
+  it('includes rejection breakdown when articles exist but nothing extracts', async () => {
+    const page = createPage({
+      status: 'no_rows',
+      rows: [],
+      diagnostics: {
+        articleCount: 2,
+        actionMenuCount: 1,
+        fallbackActionCount: 1,
+        mainTextLength: 976,
+        rejections: [
+          { reason: 'suggestion', author: '', snippet: 'People you may know' },
+          { reason: 'insufficient_evidence', author: 'Ghost', snippet: 'Short' },
+        ],
+      },
+    });
+
+    const err = await __test__.command.func(page, { limit: 5 }).catch((e) => e);
+    expect(err).toBeInstanceOf(CommandExecutionError);
+    expect(err.hint).toMatch(/rejected=2/);
+    expect(err.hint).toMatch(/suggestion=1/);
+    expect(err.hint).toMatch(/insufficient_evidence=1/);
+  });
+
   it('filters decoy rows but keeps readable feed rows when mixed', async () => {
     const page = createPage({
       status: 'ok',
