@@ -117,8 +117,9 @@ function summarizeFeedRejections(diagnostics) {
   }
   const decoyCount = (counts.decoy_author || 0) + (counts.decoy_content || 0);
   const samples = rejections.slice(0, 3).map((entry) => {
+    const len = typeof entry?.textLength === 'number' ? `(len=${entry.textLength})` : '';
     const author = entry?.author ? ` author="${entry.author}"` : '';
-    return `${entry?.reason || 'unknown'}${author}`;
+    return `${entry?.reason || 'unknown'}${len}${author}`;
   });
   return {
     rejections,
@@ -138,6 +139,17 @@ function describeFeedRejections(diagnostics) {
   }
   if (samples.length > 0) parts.push(`samples=${samples.join('; ')}`);
   return parts.join(', ');
+}
+
+function needsMoreFeedHydration(payload) {
+  if (!payload || !Array.isArray(payload.rows) || payload.rows.length > 0) return false;
+  const diagnostics = payload.diagnostics || {};
+  if ((diagnostics.mainTextLength || 0) < 400) return false;
+  const rejections = Array.isArray(diagnostics.rejections) ? diagnostics.rejections : [];
+  if (!rejections.some((entry) => entry?.reason === 'too_short')) return false;
+  return (diagnostics.actionMenuCount || 0) > 0
+    || (diagnostics.primaryCount || 0) > 0
+    || (diagnostics.articleCount || 0) > 0;
 }
 
 // Shared by the surface probe and the extractor so both agree on what counts
@@ -681,7 +693,32 @@ function buildFeedExtractScript(limit) {
         reason: rejectionReason(root),
         author: author.substring(0, 40),
         snippet: (content || textOf(root)).substring(0, 80),
+        textLength: textOf(root).length,
       };
+    }
+
+    function postMenuIn(root) {
+      return Array.from(root.querySelectorAll('[aria-label]'))
+        .some((node) => isPostActionLabel(labelOf(node)));
+    }
+
+    // Facebook often nests a short role=article header inside a FeedUnit that
+    // carries the real post body. Promote so lazy chrome stubs do not hide posts.
+    function resolveArticleContainer(el) {
+      const directLen = textOf(el).length;
+      if (directLen > 30) return el;
+      const candidates = [
+        el.closest('[data-pagelet^="FeedUnit"]'),
+        el.closest('[aria-posinset]'),
+      ].filter(Boolean);
+      for (const candidate of candidates) {
+        if (!withinFeedScope(candidate)) continue;
+        if (textOf(candidate).length <= 30) continue;
+        if (postMenuIn(candidate) || findAuthor(candidate) || postUrlFrom(candidate)) {
+          return candidate;
+        }
+      }
+      return el;
     }
 
     function extractPost(root, index) {
@@ -728,15 +765,38 @@ function buildFeedExtractScript(limit) {
     function primaryContainers() {
       const root = feedRoot();
       if (!root) return [];
-      return Array.from(root.querySelectorAll('[role="article"]'))
-        .filter((el) => {
-          if (!withinFeedScope(el)) return false;
-          if (textOf(el).length <= 30) return false;
-          const hasCommentScopedLink = Boolean(el.querySelector('a[href*="comment_id="]'));
-          const hasPostMenu = Array.from(el.querySelectorAll('[aria-label]'))
-            .some((node) => isPostActionLabel(labelOf(node)));
-          return !hasCommentScopedLink || hasPostMenu;
-        });
+      const seen = new WeakSet();
+      const containers = [];
+      for (const raw of Array.from(root.querySelectorAll('[role="article"]'))) {
+        const el = resolveArticleContainer(raw);
+        if (seen.has(el)) continue;
+        if (!withinFeedScope(el)) continue;
+        if (textOf(el).length <= 30) continue;
+        const hasCommentScopedLink = Boolean(el.querySelector('a[href*="comment_id="]'));
+        const hasPostMenu = postMenuIn(el);
+        if (hasCommentScopedLink && !hasPostMenu) continue;
+        seen.add(el);
+        containers.push(el);
+      }
+      return containers;
+    }
+
+    function feedUnitContainers() {
+      const root = feedRoot();
+      if (!root) return [];
+      const seen = new Set();
+      const containers = [];
+      for (const unit of feedUnitEls()) {
+        if (!withinFeedScope(unit)) continue;
+        if (textOf(unit).length <= 30) continue;
+        const author = findAuthor(unit);
+        if (!postMenuIn(unit) && !author && !postUrlFrom(unit)) continue;
+        const key = postUrlFrom(unit) || author || textOf(unit).substring(0, 80);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        containers.push(unit);
+      }
+      return containers;
     }
 
     // Modern Facebook no longer wraps posts in [role="article"] nor exposes the
@@ -850,24 +910,25 @@ function buildFeedExtractScript(limit) {
     }
 
     function primaryRejectionReason(el) {
+      const resolved = resolveArticleContainer(el);
       if (!withinFeedScope(el)) return 'out_of_scope';
-      if (textOf(el).length <= 30) return 'too_short';
+      if (textOf(resolved).length <= 30) return 'too_short';
       const hasCommentScopedLink = Boolean(el.querySelector('a[href*="comment_id="]'));
-      const hasPostMenu = Array.from(el.querySelectorAll('[aria-label]'))
-        .some((node) => isPostActionLabel(labelOf(node)));
+      const hasPostMenu = postMenuIn(resolved);
       if (hasCommentScopedLink && !hasPostMenu) return 'comment_thread';
       return null;
     }
 
     const primary = primaryContainers();
     const actionAnchored = actionAnchoredContainers();
-    const combined = dedupe([...primary, ...actionAnchored, ...fallbackContainers()]);
+    const combined = dedupe([...primary, ...feedUnitContainers(), ...actionAnchored, ...fallbackContainers()]);
     const primarySet = new Set(primary);
     const rejections = [];
     const feedRootEl = feedRoot();
     if (feedRootEl) {
       for (const el of Array.from(feedRootEl.querySelectorAll('[role="article"]'))) {
-        if (primarySet.has(el)) continue;
+        const resolved = resolveArticleContainer(el);
+        if (primarySet.has(el) || primarySet.has(resolved)) continue;
         const reason = primaryRejectionReason(el);
         if (reason) {
           const sample = rejectionSample(el);
@@ -906,6 +967,9 @@ function buildFeedExtractScript(limit) {
   })()`;
 }
 
+const FEED_SCROLL_MAX_PASSES = 12;
+const FEED_SCROLL_SLEEP_MS = 1200;
+
 // Facebook streams feed posts in lazily as you scroll, so a single extraction
 // off the initial viewport under-returns. Scroll a bounded number of times
 // until enough post action-menus are present (or we stop growing). See #2089.
@@ -917,17 +981,20 @@ async function loadFeedPosts(page, limit) {
     const root = feedLandmarkEl() || (feedLandmarkKind() ? mainEl() : null) || (loc.onHome ? null : mainEl());
     if (!root) return 0;
     // The home feed scrolls with the window; role=feed itself is not a scroll
-    // container. Nudge both so lazy posts stream in.
-    root.scrollTop = root.scrollHeight;
-    window.scrollTo(0, document.body.scrollHeight);
-    await sleep(800);
+    // container. Walk down incrementally so lazy posts stream in.
+    const step = Math.max(500, Math.floor((window.innerHeight || 800) * 0.85));
+    window.scrollBy(0, step);
+    if (typeof root.scrollTop === 'number') {
+      root.scrollTop = Math.min(root.scrollTop + step, root.scrollHeight);
+    }
+    await sleep(${FEED_SCROLL_SLEEP_MS});
     return root.querySelectorAll('[role="article"]').length + postMenuEls().length + feedUnitEls().length;
   })()`;
   const extractStep = buildFeedExtractScript(limit);
   let prevMarkerCount = -1;
   let prevRowCount = -1;
   let stalledPasses = 0;
-  for (let i = 0; i < 8; i += 1) {
+  for (let i = 0; i < FEED_SCROLL_MAX_PASSES; i += 1) {
     let markerCount = 0;
     try { markerCount = Number(unwrapBrowserResult(await page.evaluate(scrollStep))) || 0; } catch { break; }
 
@@ -935,8 +1002,9 @@ async function loadFeedPosts(page, limit) {
     // Do not stop merely because those markers reached --limit (#2195); stop
     // when the actual feed extractor has enough valid rows.
     let rowCount = 0;
+    let payload = null;
     try {
-      const payload = unwrapBrowserResult(await page.evaluate(extractStep));
+      payload = unwrapBrowserResult(await page.evaluate(extractStep));
       rowCount = Array.isArray(payload && payload.rows) ? payload.rows.length : 0;
     } catch {
       // The final extraction below owns error classification. A transient
@@ -944,7 +1012,9 @@ async function loadFeedPosts(page, limit) {
     }
     if (rowCount >= limit) break;
 
-    if (markerCount === prevMarkerCount && rowCount === prevRowCount) {
+    if (needsMoreFeedHydration(payload)) {
+      stalledPasses = 0;
+    } else if (markerCount === prevMarkerCount && rowCount === prevRowCount) {
       stalledPasses += 1;
       if (stalledPasses >= 2) break;
     } else {
@@ -1038,20 +1108,33 @@ async function getFacebookFeed(page, kwargs) {
   const rejectionDetails = describeFeedRejections(diagnostics);
   const baseDiagnostics = `articles=${diagnostics.articleCount || 0}, actions=${diagnostics.fallbackActionCount || 0}, mainTextLength=${diagnostics.mainTextLength || 0}`;
 
-  if (rejectionSummary.allDecoy) {
-    const sampleAuthor = rejectionSummary.rejections[0]?.author || '(no author)';
+  const tooShortCount = rejectionSummary.counts.too_short || 0;
+  const substantiveRejections = rejectionSummary.rejections.filter((entry) => entry.reason !== 'too_short');
+  const allSubstantiveDecoy = substantiveRejections.length > 0
+    && substantiveRejections.every((entry) => entry.reason === 'decoy_content' || entry.reason === 'decoy_author');
+
+  if (allSubstantiveDecoy) {
+    const sampleAuthor = substantiveRejections.find((entry) => entry.reason === 'decoy_content')?.author
+      || substantiveRejections[0]?.author
+      || '(no author)';
+    const chromeNote = tooShortCount > 0
+      ? ` Found ${tooShortCount} short article chrome stub(s) (textLength≤30, likely Stories/composer placeholders). Scroll/hydration did not surface a readable post.`
+      : '';
     throw new CommandExecutionError(
       'facebook feed rows look like anti-scrape decoy posts instead of readable news-feed content',
-      `All ${rejectionSummary.rejections.length} candidate article(s) failed readability checks (e.g. author="${sampleAuthor}"). `
+      `All ${substantiveRejections.length} candidate post(s) failed readability checks (e.g. author="${sampleAuthor}").${chromeNote} `
       + `Diagnostics: ${baseDiagnostics}${rejectionDetails ? `, ${rejectionDetails}` : ''}. `
       + 'Facebook may be serving poisoned feed markup — retry `opencli facebook feed` once the home news feed shows real posts.',
     );
   }
 
   if (diagnostics.articleCount || diagnostics.actionMenuCount || diagnostics.fallbackActionCount || diagnostics.mainTextLength > 200) {
+    const hydrationHint = tooShortCount > 0 && (diagnostics.mainTextLength || 0) > 400
+      ? ` ${tooShortCount} role=article node(s) were feed chrome stubs (textLength≤30) — not failed post extractions.`
+      : '';
     throw new CommandExecutionError(
       'facebook feed page rendered but no feed rows could be extracted',
-      `Diagnostics: ${baseDiagnostics}${rejectionDetails ? `, ${rejectionDetails}` : ''}.`,
+      `Diagnostics: ${baseDiagnostics}${rejectionDetails ? `, ${rejectionDetails}` : ''}.${hydrationHint}`,
     );
   }
 
@@ -1094,4 +1177,5 @@ export const __test__ = {
   isScrambledFeedText,
   summarizeFeedRejections,
   describeFeedRejections,
+  needsMoreFeedHydration,
 };
