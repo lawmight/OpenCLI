@@ -116,7 +116,7 @@ Keep lawmight pull requests 1 through 5 as the runtime on branch `lawmight/fb-ch
 
 Do not supersede them. Rebase them onto upstream `main` only as a stack that starts with `02e53a9c`. That commit carries the same feed blobs as open upstream pull request 2453. Isolated cherry-picks of pull request 1 onto `main` conflict. Replaying after `02e53a9c` was clean.
 
-`feed.js` and `feed.test.js` on the fork match pull request 2453 head `6ca8b00a`. Upstream pull request 2453 is already on the fork as `02e53a9c`.
+Commit `02e53a9c` on the fork has the same `feed.js` blob and the same `feed.test.js` blob as pull request 2453 head `6ca8b00a`. Those blobs are `73076f5c7459412d3c6e4cbbcc9470df81455830` and `401c03cf1c04c820788c93c08726b3153df5ad33`. Tip `0eac2994` is later, after lawmight pull requests 1 through 5. Its `feed.js` sha256 is `7e865e1ccfc27f3d91b5a8f5d8bd396b325db03b80cebcadffc4ae99a900ee3c`.
 
 ## Recommended build
 
@@ -124,7 +124,7 @@ The base commit is `0eac2994f7234151763e38b038d89ab73d21361c`. The version strin
 
 The base is `0eac2994` because that commit already contains pull requests 1 through 5, the current-DOM commit, and six browser-session commits. It keeps the sitemaps and the 13 external CLIs that `#2539` deletes. Leave `#2539` out when the goal is max connections.
 
-The plan is false if `0eac2994` does not contain those five pull requests, the current-DOM commit, and the six browser-session commits. The plan is false if that commit is not 19 ahead of tag `v1.8.8` and 1 behind `main`. The plan is false if `feed.js` at that commit does not match pull request 2453 head `6ca8b00a`. The plan is false for any queued pull request that no longer merges cleanly onto `0eac2994`.
+The plan is false if `0eac2994` does not contain those five pull requests, the current-DOM commit, and the six browser-session commits. The plan is false if that commit is not 19 ahead of tag `v1.8.8` and 1 behind `main`. The plan is false if `feed.js` at that tip still hashes to `d7b4ddb725891743e62a83959859023dabe57497d0df800490984b72564f644c`. Measured on 2026-10-05, the tip hashes to `7e865e1ccfc27f3d91b5a8f5d8bd396b325db03b80cebcadffc4ae99a900ee3c`. The plan is also false if `02e53a9c` no longer shares blob `73076f5c7459412d3c6e4cbbcc9470df81455830` with pull request 2453 head `6ca8b00a`. The plan is false for any queued pull request that no longer merges cleanly onto `0eac2994`.
 
 Patches below are applied only after approval, and only if they still merge cleanly onto `0eac2994`.
 
@@ -165,13 +165,15 @@ Do not run `npm i -g @jackwener/opencli@1.8.7` unless a later proof shows Facebo
 
 The proof that lifts the ban is an installed `feed.js` sha256 that differs from `d7b4ddb725891743e62a83959859023dabe57497d0df800490984b72564f644c`, plus a pass on the four fork fixtures. Those fixtures are messenger bleed, adolph decoy, french post, and short article.
 
+On 2026-10-05 the registry tarballs `opencli-1.8.7.tgz` and `opencli-1.8.8.tgz` both hashed `package/clis/facebook/feed.js` to that same value. Tag `v1.8.8` and upstream `main` `24136945` hashed the same. `gh pr view` the same day showed lawmight pull requests 1 through 5 as MERGED, and showed the queued upstream pull requests as MERGEABLE against their own bases. That state is not a clean-merge result onto `0eac2994`.
+
 ## Tradeoffs
 
 | Option | Feed identity | Connections | Condition that favors it |
 | --- | --- | --- | --- |
 | Registry 1.8.8, published 2026-09-23, no `gitHead` | `feed.js` sha256 equals the 1.8.7 hash `d7b4ddb725891743e62a83959859023dabe57497d0df800490984b72564f644c` | 179 sites and 1366 commands, the same counts as tag `v1.8.8` and the fork | Favor it only after the ban proof, because this pack is not the fork feed |
 | Upstream `main` `24136945847afbfad266c6c46a8cd335377f9112` | Tip commit message is "Remove site sitemaps and external CLI hub #2539", dated 2026-09-24 | Deletes 4 sitemaps, 2 sitemap skills, and 13 external CLIs. Adapter count remains 179 sites and 1366 commands | Favor it when those deletions are accepted. Reject it when the goal is max connections |
-| Fork `0eac2994` plus the named patch queue | Contains lawmight pull requests 1 through 5, the current-DOM commit, and six browser-session commits. `feed.js` matches pull request 2453 head `6ca8b00a` | Keeps the sitemaps and the 13 external CLIs. The fork adds zero sites. Counts stay 179 sites and 1366 commands | Favor it when the fork runtime must keep the sitemaps and the 13 external CLIs. Patches land only after approval and only when each one still merges cleanly onto `0eac2994` |
+| Fork `0eac2994` plus the named patch queue | Contains lawmight pull requests 1 through 5, the current-DOM commit, and six browser-session commits. Tip `feed.js` sha256 is `7e865e1ccfc27f3d91b5a8f5d8bd396b325db03b80cebcadffc4ae99a900ee3c`, which is not the registry hash. Parent `02e53a9c` matches pull request 2453 | Keeps the sitemaps and the 13 external CLIs. The fork adds zero sites. Counts stay 179 sites and 1366 commands | Favor it when the fork runtime must keep the sitemaps and the 13 external CLIs. Patches land only after approval and only when each one still merges cleanly onto `0eac2994` |
 
 ## Approval gate
 
