@@ -1911,23 +1911,46 @@ async function handleTabs(cmd: Command, leaseKey: string): Promise<Result> {
         const created = await createOwnedTabLease(leaseKey, cmd.url);
         return pageScopedResult(cmd.id, created.tabId, { url: created.tab?.url });
       }
-      const windowId = await getAutomationWindow(leaseKey);
-      let tab = await chrome.tabs.create({ windowId, url: cmd.url ?? BLANK_PAGE, active: true });
-      const tabId = tab.id;
-      if (!tabId) return { id: cmd.id, ok: false, error: 'Failed to create tab' };
-      const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), windowId, [tabId]);
-      const sessionWindowId = group?.windowId ?? tab.windowId;
-      if (tab.windowId !== sessionWindowId) tab = await chrome.tabs.get(tabId);
-      setLeaseSession(leaseKey, {
-        session: getSessionFromKey(leaseKey),
-        surface: getSurfaceFromKey(leaseKey),
-        kind: 'owned',
-        windowId: sessionWindowId,
-        owned: true,
-        preferredTabId: tabId,
+      // One lease transition at a time, on the same queue createOwnedTabLease uses. Two commands
+      // may share a lease (a persistent site session), and `tabs.create` is awaited in the middle
+      // of this: unserialized, both would read the same outgoing tab, both would move the lease,
+      // and the loser's new tab would be orphaned exactly the way this change exists to prevent.
+      return await withLeaseMutation(async () => {
+        const windowId = await getAutomationWindow(leaseKey);
+        // The lease points at exactly one tab, and the assignment below moves it to the new one.
+        // Read the outgoing tab inside the lock: after the move, releaseLease can no longer reach
+        // it, so only `replace` will ever close it.
+        const superseded = automationSessions.get(leaseKey)?.preferredTabId ?? null;
+        let tab = await chrome.tabs.create({ windowId, url: cmd.url ?? BLANK_PAGE, active: true });
+        const tabId = tab.id;
+        if (!tabId) return { id: cmd.id, ok: false, error: 'Failed to create tab' };
+        const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), windowId, [tabId]);
+        const sessionWindowId = group?.windowId ?? tab.windowId;
+        if (tab.windowId !== sessionWindowId) tab = await chrome.tabs.get(tabId);
+        setLeaseSession(leaseKey, {
+          session: getSessionFromKey(leaseKey),
+          surface: getSurfaceFromKey(leaseKey),
+          kind: 'owned',
+          windowId: sessionWindowId,
+          owned: true,
+          preferredTabId: tabId,
+        });
+        // `replace` means "open this in place of the tab I already hold". Without it the outgoing
+        // tab stays open for good: gotoResilient's rejected-navigation fallback left 11 of them in
+        // one scheduled run on 2026-09-17. Closing is best-effort — the new tab is already the
+        // lease's, so a tab we cannot remove is a leftover, never a failed command.
+        if (cmd.replace && superseded !== null && superseded !== tabId) {
+          identity.evictTab(superseded);
+          await executor.abandonPage(
+            superseded,
+            async () => { await chrome.tabs.remove(superseded).catch(() => {}); },
+            tabSettled(superseded),
+          ).catch(() => {});
+          await safeDetach(superseded);
+        }
+        resetWindowIdleTimer(leaseKey);
+        return pageScopedResult(cmd.id, tabId, { url: tab.url });
       });
-      resetWindowIdleTimer(leaseKey);
-      return pageScopedResult(cmd.id, tabId, { url: tab.url });
     }
     case 'close': {
       if (cmd.index !== undefined) {

@@ -2365,23 +2365,39 @@ async function handleTabs(cmd, leaseKey) {
         const created = await createOwnedTabLease(leaseKey, cmd.url);
         return pageScopedResult(cmd.id, created.tabId, { url: created.tab?.url });
       }
-      const windowId = await getAutomationWindow(leaseKey);
-      let tab = await chrome.tabs.create({ windowId, url: cmd.url ?? BLANK_PAGE, active: true });
-      const tabId = tab.id;
-      if (!tabId) return { id: cmd.id, ok: false, error: "Failed to create tab" };
-      const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), windowId, [tabId]);
-      const sessionWindowId = group?.windowId ?? tab.windowId;
-      if (tab.windowId !== sessionWindowId) tab = await chrome.tabs.get(tabId);
-      setLeaseSession(leaseKey, {
-        session: getSessionFromKey(leaseKey),
-        surface: getSurfaceFromKey(leaseKey),
-        kind: "owned",
-        windowId: sessionWindowId,
-        owned: true,
-        preferredTabId: tabId
+      return await withLeaseMutation(async () => {
+        const windowId = await getAutomationWindow(leaseKey);
+        const superseded = automationSessions.get(leaseKey)?.preferredTabId ?? null;
+        let tab = await chrome.tabs.create({ windowId, url: cmd.url ?? BLANK_PAGE, active: true });
+        const tabId = tab.id;
+        if (!tabId) return { id: cmd.id, ok: false, error: "Failed to create tab" };
+        const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), windowId, [tabId]);
+        const sessionWindowId = group?.windowId ?? tab.windowId;
+        if (tab.windowId !== sessionWindowId) tab = await chrome.tabs.get(tabId);
+        setLeaseSession(leaseKey, {
+          session: getSessionFromKey(leaseKey),
+          surface: getSurfaceFromKey(leaseKey),
+          kind: "owned",
+          windowId: sessionWindowId,
+          owned: true,
+          preferredTabId: tabId
+        });
+        if (cmd.replace && superseded !== null && superseded !== tabId) {
+          evictTab(superseded);
+          await abandonPage(
+            superseded,
+            async () => {
+              await chrome.tabs.remove(superseded).catch(() => {
+              });
+            },
+            tabSettled(superseded)
+          ).catch(() => {
+          });
+          await safeDetach(superseded);
+        }
+        resetWindowIdleTimer(leaseKey);
+        return pageScopedResult(cmd.id, tabId, { url: tab.url });
       });
-      resetWindowIdleTimer(leaseKey);
-      return pageScopedResult(cmd.id, tabId, { url: tab.url });
     }
     case "close": {
       if (cmd.index !== void 0) {
