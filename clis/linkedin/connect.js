@@ -1,6 +1,6 @@
 import { cli, Strategy } from '@jackwener/opencli/registry';
 import { ArgumentError, AuthRequiredError, CommandExecutionError } from '@jackwener/opencli/errors';
-import { unwrapEvaluateResult } from './shared.js';
+import { LINKEDIN_AUTH_WALL_JS, unwrapEvaluateResult } from './shared.js';
 import { gotoResilient } from '@jackwener/opencli/browser/utils';
 
 const LINKEDIN_DOMAIN = 'www.linkedin.com';
@@ -137,9 +137,8 @@ function buildProfileProbeScript(expectedName = '') {
       .toLowerCase();
     const tokens = (s) => normalizeName(s).replace(/[.'-]+/g, ' ').split(/\s+/).map((t) => t.trim()).filter((t) => t.length >= 2);
     const text = document.body ? (document.body.innerText || '') : '';
-    const authRequired = /\b(sign in|log in|join linkedin)\b/i.test(text)
-      || /linkedin\.com\/(login|checkpoint|authwall)/i.test(location.href)
-      || /captcha|verification required/i.test(text);
+    ${LINKEDIN_AUTH_WALL_JS}
+    const authRequired = linkedInAuthWall();
     const main = document.querySelector('main') || document.body;
     // LinkedIn profile pages no longer expose the name in an <h1>; the heading
     // markup churns, but document.title is a stable "Name | LinkedIn" pattern.
@@ -251,11 +250,8 @@ function buildSentInvitationsProbeScript(expectedName, expectedProfileUrl) {
         return url.toString();
       } catch { return ''; }
     };
-    const text = document.body ? (document.body.innerText || '') : '';
-    const authRequired = /\b(sign in|log in|join linkedin)\b/i.test(text)
-      || /linkedin\.com\/(login|checkpoint|authwall)/i.test(location.href)
-      || /captcha|verification required/i.test(text);
-    if (authRequired) return { authRequired: true, found: false, matchedName: '', matchedUrl: '', visibleNames: [] };
+    ${LINKEDIN_AUTH_WALL_JS}
+    if (linkedInAuthWall()) return { authRequired: true, found: false, matchedName: '', matchedUrl: '', visibleNames: [] };
     const structuralRows = Array.from(document.querySelectorAll('li, article, [data-view-name], .mn-invitation-card'));
     const linkRows = Array.from(document.querySelectorAll('a[href*="/in/"]'))
       .map((a) => a.closest('li') || a.closest('[data-view-name]') || a.closest('[class*="invitation"]') || a.closest('div'))

@@ -12,6 +12,7 @@ const {
     clampNote,
     assessProfileSafety,
     buildProfileProbeScript,
+    buildSentInvitationsProbeScript,
 } = await import('./connect.js').then((m) => m.__test__);
 
 function makeFakePage(probe, sendResult = { ok: true, status: 'sent', reason: 'connection_request_sent' }) {
@@ -60,7 +61,7 @@ function makeMoreMenuFakePage(values, openResult = { ok: true, opened: 'dialog' 
     };
 }
 
-function evaluateProfileProbe(html, expectedName = 'Jane Doe') {
+function evaluateProfileProbe(html, expectedName = 'Jane Doe', { withText = false } = {}) {
     const dom = new JSDOM(html, {
         url: 'https://www.linkedin.com/in/jane/',
         runScripts: 'outside-only',
@@ -71,6 +72,13 @@ function evaluateProfileProbe(html, expectedName = 'Jane Doe') {
             return this.dataset.hidden === 'true' ? null : dom.window.document.body;
         },
     });
+    // jsdom has no innerText; the auth-wall cases need the page text the way a browser reads it.
+    if (withText) {
+        Object.defineProperty(dom.window.HTMLElement.prototype, 'innerText', {
+            configurable: true,
+            get() { return this.textContent; },
+        });
+    }
     return dom.window.eval(buildProfileProbeScript(expectedName));
 }
 
@@ -134,6 +142,57 @@ describe('linkedin connect helpers', () => {
     it('still blocks when neither a Connect button nor a More menu is present', () => {
         const result = assessProfileSafety({ name: 'Jane Doe', url: 'https://www.linkedin.com/in/jane/', connectAvailable: false, moreAvailable: false }, 'Jane Doe', 'https://www.linkedin.com/in/jane/');
         expect(result.blockReason).toBe('connect_button_not_found');
+    });
+
+    it('does not read a member post that says "log in" as an auth wall on a signed-in profile', () => {
+        // 2026-09-26: a post reading "👉 Log in to https://exoc.ad/..." made this probe report
+        // auth_required on a signed-in page, and the daily run hard-stopped its invitations.
+        const probe = evaluateProfileProbe(`
+          <header>
+            <a href="https://www.linkedin.com/messaging/?">Messaging</a>
+            <a href="https://www.linkedin.com/notifications/?">Notifications</a>
+          </header>
+          <main>
+            <section class="pv-top-card">
+              <h1>Jane Doe</h1>
+              <div class="pvs-profile-actions">
+                <button aria-label="Follow Jane Doe">Follow</button>
+                <button aria-label="More actions">More</button>
+              </div>
+            </section>
+            <section><p>👉 Log in to https://exoc.ad/x to claim your seat</p></section>
+          </main>
+        `, 'Jane Doe', { withText: true });
+        expect(probe.authRequired).toBe(false);
+        expect(probe.name).toBe('Jane Doe');
+        expect(probe.moreAvailable).toBe(true);
+    });
+
+    it('still reports the signed-out view of a profile as an auth wall', () => {
+        const probe = evaluateProfileProbe(`
+          <header>
+            <a href="https://www.linkedin.com/login?session_redirect=%2Fin%2Fjane%2F">Sign in</a>
+            <a href="https://www.linkedin.com/signup/cold-join">Join now</a>
+          </header>
+          <main><h1>Jane Doe</h1></main>
+        `, 'Jane Doe', { withText: true });
+        expect(probe.authRequired).toBe(true);
+    });
+
+    it('verifies a sent invitation whose invitee headline says "sign in"', () => {
+        const dom = new JSDOM(`
+          <header><a href="https://www.linkedin.com/messaging/?">Messaging</a></header>
+          <ul><li>
+            <a href="/in/jane/">Jane Doe</a>
+            <p>Sign in to our patient portal | Dentist</p>
+          </li></ul>
+        `, { url: 'https://www.linkedin.com/mynetwork/invitation-manager/sent/', runScripts: 'outside-only' });
+        Object.defineProperty(dom.window.HTMLElement.prototype, 'innerText', {
+            configurable: true,
+            get() { return this.textContent; },
+        });
+        const probe = dom.window.eval(buildSentInvitationsProbeScript('Jane Doe', 'https://www.linkedin.com/in/jane/'));
+        expect(probe).toMatchObject({ authRequired: false, found: true, matchedUrl: 'https://www.linkedin.com/in/jane/' });
     });
 
     it('scopes profile action probing to the profile owner instead of sidebar cards', () => {

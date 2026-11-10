@@ -454,7 +454,7 @@ describe('executeCommand — non-browser timeout', () => {
     await expect(executeCommand(cmd, {})).resolves.toEqual([{ ok: true }]);
 
     expect(goto).toHaveBeenCalledTimes(2);
-    expect(newTab).toHaveBeenCalledWith('https://example.com');
+    expect(newTab).toHaveBeenCalledWith('https://example.com', { replace: true });
     expect(setActivePage).toHaveBeenCalledWith('p2');
     expect(func).toHaveBeenCalledTimes(1);
     vi.restoreAllMocks();

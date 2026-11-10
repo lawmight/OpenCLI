@@ -1,6 +1,6 @@
 {
   "name": "@jackwener/opencli",
-  "version": "2.0.3-suited.20261110",
+  "version": "2.0.3-suited.20261110b",
   "publishConfig": {
     "access": "public",
     "provenance": true
