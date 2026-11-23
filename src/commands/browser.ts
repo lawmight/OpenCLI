@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { DEFAULT_BROWSER_CONNECT_TIMEOUT } from '../browser/config.js';
+import { cleanSavedOpenCLIGroups, launcherConfigPath, loadLauncherConfig } from '../browser/browser-launcher.js';
 import { bindTab, BrowserCommandError, sendCommand } from '../browser/daemon-client.js';
 import { buildExtractHtmlJs, runExtractFromHtml } from '../browser/extract.js';
 import { buildFindJs, buildSemanticFindJs, isFindError, type FindError, type FindResult, type SemanticFindOptions } from '../browser/find.js';
@@ -586,6 +587,18 @@ export function registerBrowserCommands(program: Command): Command {
       emitResult({ unbound: true, session });
     }));
 
+  browser.command('clean-saved-groups')
+    .description('Drop saved "OpenCLI Browser" tab groups from a stopped Chromium profile (profile dir from browser-launcher.json)')
+    .option('--profile-dir <dir>', 'Chromium profile directory, e.g. ~/.config/chromium/Default')
+    .action((opts: { profileDir?: string }) => {
+      const profileDir = opts.profileDir ?? loadLauncherConfig().profileDir;
+      if (!profileDir) {
+        emitFailure({ code: 'invalid_args', message: `No profile dir: pass --profile-dir or set "profileDir" in ${launcherConfigPath()}.`, exitCode: 2 });
+        return;
+      }
+      emitResult(cleanSavedOpenCLIGroups(profileDir));
+    });
+
   const browserTab = browser
     .command('tab')
     .description('Tab management — list, create, and close tabs in the browser session');
@@ -1163,10 +1176,11 @@ export function registerBrowserCommands(program: Command): Command {
     addSemanticLocatorOptions(get.command('text'))
       .argument('[target]', 'Numeric ref (from browser state / find), CSS selector, or omit when using --role/--name/etc.')
       .option('--nth <n>', 'Pick the nth match (0-based) when <target> is a multi-match CSS selector')
-      .description('Element text content — JSON envelope {value, matches_n}'),
+      .option('--raw', 'Return raw DOM textContent (includes <script>, <style>, hidden elements)')
+      .description('Element rendered text (use --raw for DOM textContent) — JSON envelope {value, matches_n}'),
   )
     .action(browserAction(async (page, target, opts) =>
-      runGetCommand(page, target, opts ?? {}, getTextResolvedJs(), 'text')));
+      runGetCommand(page, target, opts ?? {}, getTextResolvedJs({ raw: Boolean(opts?.raw) }), 'text')));
 
   addBrowserTabOption(
     addSemanticLocatorOptions(get.command('value'))

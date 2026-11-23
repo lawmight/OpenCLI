@@ -7,6 +7,60 @@ export async function fetchRankedRedditSearch(query, subreddit, sort, time, limi
     const seenPages = new Set();
     const ids = [];
     const seenIds = new Set();
+    // What each result card itself shows, kept in case /by_id hydration is
+    // blocked by Reddit's network-security filter (#2720).
+    const cards = new Map();
+    // Stricter server-rendered listing fields (#2840). Hydration supplies
+    // body/media, but that endpoint can be blocked independently. Incomplete
+    // rows are omitted rather than filled with fabricated zeros.
+    const listingRows = new Map();
+    function readListing(unit, id, context) {
+        const link = unit.querySelector('[data-testid="post-title-text"], [data-testid="post-title"]');
+        const permalink = link?.getAttribute('href') || '';
+        const counters = unit.querySelectorAll('[data-testid="search-counter-row"] faceplate-number[number]');
+        const score = counters[0]?.getAttribute('number');
+        const comments = counters[1]?.getAttribute('number');
+        const timestamp = unit.querySelector('time[datetime]')?.getAttribute('datetime')
+            || unit.querySelector('faceplate-timeago[ts]')?.getAttribute('ts');
+        const created = Date.parse(timestamp || '') / 1000;
+        const title = context?.post?.title || link?.textContent?.trim();
+        const community = context?.subreddit?.name;
+        if (!(title && community && permalink.startsWith('/r/')
+            && permalink.split('/')[4] === id.slice(3)
+            && score !== undefined && comments !== undefined
+            && Number.isFinite(Number(score)) && Number.isFinite(Number(comments))
+            && Number.isFinite(created))) return null;
+        return { kind: 't3', data: {
+            id: id.slice(3), name: id, title,
+            subreddit_name_prefixed: 'r/' + community,
+            author: context?.profile?.name || '',
+            score: Number(score), num_comments: Number(comments),
+            permalink, created_utc: created,
+        } };
+    }
+    function readCard(unit, id, context) {
+        const permalink = Array.from(unit.querySelectorAll('a[href*="/comments/"]'))
+            .map(a => a.getAttribute('href') || '').find(href => /^\/r\/[^/]+\/comments\/[a-z0-9]+\//i.test(href)) || '';
+        const counts = {};
+        for (const number of unit.querySelectorAll('faceplate-number[number]')) {
+            const label = (number.parentElement?.textContent || '').toLowerCase();
+            const key = /\bcomments?\b/.test(label) ? 'num_comments' : /\b(?:votes?|upvotes?|points?)\b/.test(label) ? 'score' : '';
+            if (key && !(key in counts)) counts[key] = Number(number.getAttribute('number')) || 0;
+        }
+        const created = Date.parse(unit.querySelector('faceplate-timeago[ts]')?.getAttribute('ts') || '');
+        const subreddit = context?.subreddit?.name || '';
+        return { kind: 't3', data: {
+            id: id.slice(3), name: id,
+            title: typeof context?.post?.title === 'string' ? context.post.title : '',
+            subreddit_name_prefixed: subreddit ? 'r/' + subreddit : '',
+            author: typeof context?.profile?.name === 'string' ? context.profile.name : '',
+            score: counts.score || 0,
+            num_comments: counts.num_comments || 0,
+            permalink,
+            created_utc: Number.isFinite(created) ? created / 1000 : 0,
+            selftext: '',
+        } };
+    }
     const wall = (response, text, url) => ({ kind: 'login-wall', sentinel: {
         __loginWall: true, status: response.status, url: response.url || url,
         contentType: response.headers.get('content-type') || '', bodyPreview: text.slice(0, 100),
@@ -35,22 +89,34 @@ export async function fetchRankedRedditSearch(query, subreddit, sort, time, limi
         const landed = new URL(response.url || next, origin);
         if (landed.origin !== origin || /\/login\/?$|\/account\/login|\/challenge\/?$/.test(landed.pathname)) return wall(response, text, next);
         const doc = new DOMParser().parseFromString(text, 'text/html');
-        const units = Array.from(doc.querySelectorAll('[data-testid="search-post-unit"]'));
+        // Reddit serves two result-card layouts depending on the query; both carry
+        // the same post telemetry, links and counts.
+        const units = Array.from(doc.querySelectorAll('[data-testid="search-post-unit"], [data-testid="sdui-post-unit"]'));
         if (!units.length && /blocked by network security/i.test(doc.body?.textContent || '')) return blocked(response, next);
         if ((!units.length && /^(?:log in|login|access denied|blocked|security verification|just a moment)/i.test(doc.title))
             || (!units.length && /whoa there, pardner|you.ve been blocked/i.test(doc.body?.textContent || ''))
             || (!units.length && doc.querySelector('form[action*="/login"], #loginForm, #challenge-form, iframe[src*="recaptcha"], iframe[src*="hcaptcha"]'))) return wall(response, text, next);
         for (const unit of units) {
             const unitIds = new Set();
+            let context = null;
             for (const tracker of unit.querySelectorAll('search-telemetry-tracker[data-faceplate-tracking-context]')) {
                 try {
-                    const id = JSON.parse(tracker.getAttribute('data-faceplate-tracking-context'))?.post?.id;
+                    const parsed = JSON.parse(tracker.getAttribute('data-faceplate-tracking-context'));
+                    const id = parsed?.post?.id;
+                    // Last tracker with a post id wins so a richer tracker after the
+                    // identity-only one still supplies subreddit, author, and title.
+                    if (id) context = parsed;
                     if (typeof id === 'string' && /^t3_[a-z0-9]+$/.test(id)) unitIds.add(id);
                 } catch { /* Ignore non-post telemetry, never execute page scripts. */ }
             }
             if (unitIds.size !== 1) return { kind: 'malformed', detail: 'web search result has missing or ambiguous post identity' };
             const id = [...unitIds][0];
-            if (!seenIds.has(id)) { seenIds.add(id); ids.push(id); }
+            if (!seenIds.has(id)) {
+                seenIds.add(id); ids.push(id);
+                cards.set(id, readCard(unit, id, context));
+                const listingRow = readListing(unit, id, context);
+                if (listingRow) listingRows.set(id, listingRow);
+            }
             if (ids.length === limit) break;
         }
         if (ids.length >= limit) { next = ''; break; }
@@ -78,6 +144,22 @@ export async function fetchRankedRedditSearch(query, subreddit, sort, time, limi
     const byName = new Map();
     for (let offset = 0; offset < ids.length; offset += 100) {
         const result = await listing('/by_id/' + ids.slice(offset, offset + 100).join(',') + '.json?raw_json=1', '/by_id post hydration');
+        if (result.kind === 'fetch-failed' && result.failure?.reason === 'blocked') {
+            // Prefer the stricter listing fields when every ranked post has them,
+            // including posts already hydrated in an earlier batch. Otherwise keep
+            // #2798's card fields when each card shows a title and permalink.
+            // Listing-level blocks (the search page itself) still return above.
+            if (ids.every(id => listingRows.has(id))) {
+                return { kind: 'ok', rows: ids.map(id => byName.get(id) || listingRows.get(id)),
+                    listingFallback: true, capped: Boolean(next && ids.length < limit) };
+            }
+            const cardRows = ids.map(id => cards.get(id)).filter(row => row && row.data.title && row.data.permalink);
+            if (cardRows.length === ids.length) {
+                return { kind: 'ok', rows: ids.map(id => byName.get(id) || cards.get(id)),
+                    missing: 0, capped: Boolean(next && ids.length < limit), cardsOnly: true };
+            }
+            return { kind: 'malformed', detail: 'hydration was blocked and the search listing is missing post details' };
+        }
         if (result.kind !== 'ok') return result;
         for (const row of result.rows) {
             const name = row?.data?.name || (row?.data?.id ? 't3_' + row.data.id : '');

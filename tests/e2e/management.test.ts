@@ -60,7 +60,10 @@ describe('management commands E2E', () => {
   it('--version shows version number', async () => {
     const { stdout, code } = await runCli(['--version']);
     expect(code).toBe(0);
-    expect(stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+    const pkgVersion = JSON.parse(readFileSync(fileURLToPath(new URL('../../package.json', import.meta.url)), 'utf8')).version as string;
+    // Suited pins append `-suited.YYYYMMDD` (optional letter) to the upstream semver.
+    expect(pkgVersion).toMatch(/^\d+\.\d+\.\d+(?:-suited\.\d{8}[a-z]?)?$/);
+    expect(stdout.trim()).toBe(pkgVersion);
   });
 
   // ── help ──

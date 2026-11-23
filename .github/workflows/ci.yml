@@ -2,9 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches:
+      - main
+      - dev
+      - 'suited/**'
+      - suited/2.0.3-suited.20261123
   pull_request:
-    branches: [main, dev]
+    branches:
+      - main
+      - dev
+      - 'suited/**'
+      - suited/2.0.3-suited.20261110b
   schedule:
     - cron: '0 8 * * 1'  # Weekly Monday 08:00 UTC — smoke tests
   workflow_dispatch:
