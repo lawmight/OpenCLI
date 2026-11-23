@@ -477,6 +477,32 @@ function withLeaseMutation<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
+/**
+ * Chrome window/tab spawn calls have no timeout of their own. A call that never
+ * settles (in-place Chrome update under a running browser, wedged renderer)
+ * leaves the owned-container single-flight pending forever: the daemon's
+ * deadline reports command_result_unknown, and every later command queues
+ * behind the stuck lease. Bound the spawn path so it fails as a known,
+ * terminal error instead.
+ */
+const CHROME_CALL_TIMEOUT_MS = 30_000;
+
+function withChromeCallTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new CommandFailure(
+        'chrome_call_timeout',
+        `chrome.${label} did not return within ${CHROME_CALL_TIMEOUT_MS / 1000}s - Chrome never answered the call (in-place browser update, or a wedged renderer). The target may or may not exist; restart Chrome, then retry.`,
+        'Restart Chrome to clear the wedged call. Reload the extension if this repeats after a Chrome update.',
+      )), CHROME_CALL_TIMEOUT_MS);
+    }),
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
 function makeSession(
   key: string,
   session: Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt' | 'contextId' | 'ownership' | 'lifecycle' | 'windowRole'>,
@@ -588,6 +614,18 @@ function scheduleIdleAlarm(leaseKey: string, timeout: number): void {
   } catch {
     // setTimeout remains the in-process fast path; alarms are the MV3 restart recovery path.
   }
+}
+
+/** True once the tab is gone, or (when `url` is given) shows that URL. */
+function tabSettled(tabId: number, url?: string): () => Promise<boolean> {
+  return async () => {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      return url !== undefined && tab.url === url;
+    } catch {
+      return true;
+    }
+  };
 }
 
 async function safeDetach(tabId: number): Promise<void> {
@@ -1028,13 +1066,13 @@ async function ensureOwnedContainerWindowUnlocked(
 
   // Note: Do NOT set `state` parameter here. Chrome 146+ rejects 'normal' as an invalid
   // state value for windows.create(). The window defaults to 'normal' state anyway.
-  const win = await chrome.windows.create({
+  const win = await withChromeCallTimeout(chrome.windows.create({
     url: startUrl,
     focused: mode === 'foreground',
     width: 1280,
     height: 900,
     type: 'normal',
-  });
+  }), 'windows.create');
   container.windowId = win.id!;
   // Persist windowId before any further awaits so a worker crash between
   // `windows.create` returning and the subsequent `tabs.group` call still
@@ -1112,12 +1150,12 @@ async function createOwnedTabLeaseUnlocked(leaseKey: string, initialUrl?: string
     tab = await chrome.tabs.get(initialTabId);
     await consumeIdlePlaceholder(tab);
     if (!isTargetUrl(tab.url, targetUrl)) {
-      tab = await chrome.tabs.update(initialTabId, { url: targetUrl });
+      tab = await withChromeCallTimeout(chrome.tabs.update(initialTabId, { url: targetUrl }), 'tabs.update');
       await new Promise(resolve => setTimeout(resolve, 300));
       tab = await chrome.tabs.get(initialTabId);
     }
   } else {
-    tab = await chrome.tabs.create({ windowId, url: targetUrl, active: true });
+    tab = await withChromeCallTimeout(chrome.tabs.create({ windowId, url: targetUrl, active: true }), 'tabs.create');
   }
   const tabId = tab.id;
   if (!tabId) throw new Error('Failed to create tab lease in automation container');
@@ -1612,7 +1650,7 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
   const tabs = await chrome.tabs.query({ windowId: scopedWindowId });
   const reuseTab = existingSession?.owned ? undefined : tabs.find(t => t.id);
   if (reuseTab?.id) {
-    await chrome.tabs.update(reuseTab.id, { url: BLANK_PAGE });
+    await withChromeCallTimeout(chrome.tabs.update(reuseTab.id, { url: BLANK_PAGE }), 'tabs.update');
     await new Promise(resolve => setTimeout(resolve, 300));
     try {
       const updated = await chrome.tabs.get(reuseTab.id);
@@ -1624,7 +1662,7 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
   }
 
   // Fallback: create a new tab
-  const newTab = await chrome.tabs.create({ windowId: scopedWindowId, url: BLANK_PAGE, active: true });
+  const newTab = await withChromeCallTimeout(chrome.tabs.create({ windowId: scopedWindowId, url: BLANK_PAGE, active: true }), 'tabs.create');
   if (!newTab.id) throw new Error('Failed to create tab in automation container');
   await ensureOwnedContainerGroup(role, scopedWindowId, [newTab.id]);
   return { tabId: newTab.id, tab: await chrome.tabs.get(newTab.id) };
@@ -1700,6 +1738,7 @@ function classifyExtensionError(message: string): string | undefined {
   if (/CDP command .* timed out/.test(message)) return 'cdp_timeout';
   if (/attach failed|Debugger is not attached/.test(message)) return 'attach_failed';
   if (/No tab with id|no longer exists|No window with id/.test(message)) return 'tab_gone';
+  if (/JavaScript dialog is open/.test(message)) return 'javascript_dialog_open';
   return undefined;
 }
 
@@ -1793,7 +1832,7 @@ async function handleNavigate(cmd: Command, leaseKey: string): Promise<Result> {
   // observe.
   const detachAfterNavigate = !executor.hasActiveNetworkCapture(tabId);
 
-  await chrome.tabs.update(tabId, { url: targetUrl });
+  await withChromeCallTimeout(chrome.tabs.update(tabId, { url: targetUrl }), 'tabs.update');
 
   // Wait until navigation completes. Resolve when status is 'complete' AND either:
   // - the URL matches the target (handles same-URL / canonicalized navigations), OR
@@ -1898,23 +1937,46 @@ async function handleTabs(cmd: Command, leaseKey: string): Promise<Result> {
         const created = await createOwnedTabLease(leaseKey, cmd.url);
         return pageScopedResult(cmd.id, created.tabId, { url: created.tab?.url });
       }
-      const windowId = await getAutomationWindow(leaseKey);
-      let tab = await chrome.tabs.create({ windowId, url: cmd.url ?? BLANK_PAGE, active: true });
-      const tabId = tab.id;
-      if (!tabId) return { id: cmd.id, ok: false, error: 'Failed to create tab' };
-      const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), windowId, [tabId]);
-      const sessionWindowId = group?.windowId ?? tab.windowId;
-      if (tab.windowId !== sessionWindowId) tab = await chrome.tabs.get(tabId);
-      setLeaseSession(leaseKey, {
-        session: getSessionFromKey(leaseKey),
-        surface: getSurfaceFromKey(leaseKey),
-        kind: 'owned',
-        windowId: sessionWindowId,
-        owned: true,
-        preferredTabId: tabId,
+      // One lease transition at a time, on the same queue createOwnedTabLease uses. Two commands
+      // may share a lease (a persistent site session), and `tabs.create` is awaited in the middle
+      // of this: unserialized, both would read the same outgoing tab, both would move the lease,
+      // and the loser's new tab would be orphaned exactly the way this change exists to prevent.
+      return await withLeaseMutation(async () => {
+        const windowId = await getAutomationWindow(leaseKey);
+        // The lease points at exactly one tab, and the assignment below moves it to the new one.
+        // Read the outgoing tab inside the lock: after the move, releaseLease can no longer reach
+        // it, so only `replace` will ever close it.
+        const superseded = automationSessions.get(leaseKey)?.preferredTabId ?? null;
+        let tab = await withChromeCallTimeout(chrome.tabs.create({ windowId, url: cmd.url ?? BLANK_PAGE, active: true }), 'tabs.create');
+        const tabId = tab.id;
+        if (!tabId) return { id: cmd.id, ok: false, error: 'Failed to create tab' };
+        const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), windowId, [tabId]);
+        const sessionWindowId = group?.windowId ?? tab.windowId;
+        if (tab.windowId !== sessionWindowId) tab = await chrome.tabs.get(tabId);
+        setLeaseSession(leaseKey, {
+          session: getSessionFromKey(leaseKey),
+          surface: getSurfaceFromKey(leaseKey),
+          kind: 'owned',
+          windowId: sessionWindowId,
+          owned: true,
+          preferredTabId: tabId,
+        });
+        // `replace` means "open this in place of the tab I already hold". Without it the outgoing
+        // tab stays open for good: gotoResilient's rejected-navigation fallback left 11 of them in
+        // one scheduled run on 2026-09-17. Closing is best-effort — the new tab is already the
+        // lease's, so a tab we cannot remove is a leftover, never a failed command.
+        if (cmd.replace && superseded !== null && superseded !== tabId) {
+          identity.evictTab(superseded);
+          await executor.abandonPage(
+            superseded,
+            async () => { await chrome.tabs.remove(superseded).catch(() => {}); },
+            tabSettled(superseded),
+          ).catch(() => {});
+          await safeDetach(superseded);
+        }
+        resetWindowIdleTimer(leaseKey);
+        return pageScopedResult(cmd.id, tabId, { url: tab.url });
       });
-      resetWindowIdleTimer(leaseKey);
-      return pageScopedResult(cmd.id, tabId, { url: tab.url });
     }
     case 'close': {
       if (cmd.index !== undefined) {
@@ -2079,6 +2141,8 @@ async function handleCdp(cmd: Command, leaseKey: string): Promise<Result> {
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
     await executor.ensureAttached(tabId, aggressive);
+    // Answering the dialog is the one command a blocked page still accepts.
+    if (cmd.cdpMethod !== 'Page.handleJavaScriptDialog') executor.assertNoOpenDialog(tabId);
     const params = cmd.cdpParams ?? {};
     const routeFrameId = typeof params.frameId === 'string' && params.sessionId === 'target'
       ? params.frameId
@@ -2231,22 +2295,29 @@ async function releaseLease(leaseKey: string, reason: string = 'released'): Prom
         otherSession.windowId === session.windowId &&
         otherSession.preferredTabId !== null,
       );
-      await safeDetach(tabId);
       identity.evictTab(tabId);
+      // Leave the page while still attached: navigating or closing a page with a
+      // draft raises a beforeunload prompt, and only an attached debugger sees it.
+      const closeTab = () => executor.abandonPage(tabId, async () => { await chrome.tabs.remove(tabId).catch(() => {}); }, tabSettled(tabId));
       if (hasOtherOwnedLease) {
-        await chrome.tabs.remove(tabId).catch(() => {});
+        await closeTab();
+        await safeDetach(tabId);
         console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
       } else {
         try {
           const role = getOwnedWindowRole(leaseKey);
           const idleUrl = role === 'interactive'
             ? await parkIdleInteractiveTab(tabId, session.windowId) : null;
-          const tab = await chrome.tabs.update(tabId, { url: idleUrl ?? BLANK_PAGE, active: true });
-          const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), session.windowId, [tab.id ?? tabId]);
+          const target = idleUrl ?? BLANK_PAGE;
+          let tab: chrome.tabs.Tab | undefined;
+          await executor.abandonPage(tabId, async () => { tab = await chrome.tabs.update(tabId, { url: target, active: true }); }, tabSettled(tabId, target));
+          await safeDetach(tabId);
+          const group = await ensureOwnedContainerGroup(role, session.windowId, [tab?.id ?? tabId]);
           if (group) session.windowId = group.windowId;
           console.log(`[opencli] Released owned tab lease ${tabId} as reusable placeholder (session=${session.session}, surface=${session.surface}, ${reason})`);
         } catch {
-          await chrome.tabs.remove(tabId).catch(() => {});
+          await closeTab();
+          await safeDetach(tabId);
           console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
         }
       }

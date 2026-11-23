@@ -87,7 +87,7 @@ export function isNavigationRejected(error: unknown): boolean {
 
 interface ResilientPage {
   goto(url: string, options?: Record<string, unknown>): Promise<void>;
-  newTab?: (url: string) => Promise<string | null | undefined>;
+  newTab?: (url: string, options?: { replace?: boolean }) => Promise<string | null | undefined>;
   setActivePage?: (pageId: string) => Promise<void> | void;
 }
 
@@ -105,7 +105,13 @@ export async function gotoResilient(page: ResilientPage, url: string, options?: 
   } catch (error) {
     if (!isNavigationRejected(error)) throw error;
     if (typeof page.newTab === 'function' && typeof page.setActivePage === 'function') {
-      const pageId = await page.newTab(url);
+      // `replace`, because this tab takes over the lease from the one the command started on.
+      // Without it that tab stays open for good: `tabs new` moves the lease's preferredTabId to
+      // the fallback and releaseLease only ever releases the preferred one, so one daily-social
+      // run on 2026-09-17 ended with 11 leftovers. The extension closes it, since only the
+      // extension knows which tab the lease is leaving — this side cannot: page identity is
+      // assigned from a SUCCESSFUL navigate, and both navigations here were rejected.
+      const pageId = await page.newTab(url, { replace: true });
       if (pageId) {
         await page.setActivePage(pageId);
         return;

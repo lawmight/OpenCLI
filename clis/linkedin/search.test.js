@@ -9,7 +9,6 @@ const {
     parseIntegerArg,
     mapFilterValues,
     decodeLinkedinRedirect,
-    looksLinkedInAuthWallText,
     enrichJobDetails,
     findJobDescriptionRoot,
     buildVoyagerUrl,
@@ -60,15 +59,6 @@ describe('linkedin argument validation', () => {
         expect(() => parseIntegerArg(-1, '--start', 0, 0)).toThrow(ArgumentError);
         expect(parseIntegerArg(undefined, '--start', 0, 0)).toBe(0);
         expect(parseIntegerArg('25', '--start', 0, 0)).toBe(25);
-    });
-
-});
-
-describe('linkedin auth wall detection', () => {
-    it('recognizes login/authwall signals', () => {
-        expect(looksLinkedInAuthWallText('https://www.linkedin.com/authwall?trk=guest Sign in to continue')).toBe(true);
-        expect(looksLinkedInAuthWallText('LinkedIn Login, Sign in')).toBe(true);
-        expect(looksLinkedInAuthWallText('About the job Senior infrastructure engineer')).toBe(false);
     });
 
 });

@@ -52,12 +52,16 @@ describe('gotoResilient', () => {
     expect(closeWindow).not.toHaveBeenCalled();
   });
 
-  it('falls back to a new tab when the retry is rejected too', async () => {
+  // `replace` is what stops the tab the command started on from being left open for good: the
+  // lease's preferredTabId moves to the fallback and releaseLease only releases the preferred one.
+  // One scheduled run on 2026-09-17 ended with 11 leftovers. This side cannot identify that tab
+  // itself — page identity comes from a successful navigate, and both of these were rejected.
+  it('falls back to a new tab that replaces the one the lease is leaving', async () => {
     const goto = vi.fn().mockRejectedValue(new Error('Navigation rejected.'));
     const newTab = vi.fn(async () => 'p2');
     const setActivePage = vi.fn(async () => {});
     await gotoResilient({ goto, newTab, setActivePage }, 'https://a.test/');
-    expect(newTab).toHaveBeenCalledWith('https://a.test/');
+    expect(newTab).toHaveBeenCalledWith('https://a.test/', { replace: true });
     expect(setActivePage).toHaveBeenCalledWith('p2');
   });
 
