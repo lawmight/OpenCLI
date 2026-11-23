@@ -1308,15 +1308,19 @@ describe('background tab isolation', () => {
     expect(result.ok).toBe(true);
     // The debugger must stay attached across chrome.tabs.update (Chromium 152+
     // rejects a navigation issued right after a debugger detach), and the
-    // stale-attach reset must still happen once navigation has settled.
+    // stale-attach reset must still happen once that navigation has settled.
+    // Blank-lease-first (#2487) also navigates the first about:blank lease, so
+    // that earlier navigation detaches once before this one starts.
     expect(updateMock).toHaveBeenCalledWith(leaseTabId, { url: 'https://example.com/second' });
-    expect(detachMock).toHaveBeenCalledTimes(1);
     expect(detachMock).toHaveBeenCalledWith(leaseTabId);
     const updateOrder = updateMock.mock.invocationCallOrder[
       updateMock.mock.calls.findIndex((call) => call[1]?.url === 'https://example.com/second')
     ];
-    expect(hasActiveNetworkCapture.mock.invocationCallOrder[0]).toBeLessThan(updateOrder);
-    expect(updateOrder).toBeLessThan(detachMock.mock.invocationCallOrder[0]);
+    const captureBeforeUpdate = hasActiveNetworkCapture.mock.invocationCallOrder.filter((order) => order < updateOrder);
+    expect(captureBeforeUpdate.length).toBeGreaterThan(0);
+    const captureJustBefore = Math.max(...captureBeforeUpdate);
+    expect(detachMock.mock.invocationCallOrder.filter((order) => order > captureJustBefore && order < updateOrder)).toEqual([]);
+    expect(detachMock.mock.invocationCallOrder.filter((order) => order > updateOrder)).toHaveLength(1);
   });
 
   it('keeps hash routes distinct when comparing target URLs', async () => {
@@ -3043,5 +3047,71 @@ describe('background tab isolation', () => {
     expect(chrome.storage.local.remove).toHaveBeenCalledWith(REGISTRY_KEY);
     const leftover = (await chrome.storage.local.get(REGISTRY_KEY) as any)[REGISTRY_KEY];
     expect(leftover).toBeUndefined();
+  });
+
+  it('fails a chrome.tabs.create that never settles as chrome_call_timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const { chrome } = createChromeMock();
+      chrome.tabs.create = vi.fn(() => new Promise<never>(() => {}));
+      vi.stubGlobal('chrome', chrome);
+
+      const mod = await import('./background');
+      mod.__test__.setAutomationWindowId(adapterKey('stuck'), 1);
+
+      const result = mod.__test__.handleCommand({
+        id: 'stuck-new',
+        action: 'tabs',
+        op: 'new',
+        url: 'https://stuck.example/',
+        session: 'stuck',
+        surface: 'adapter',
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      expect(await result).toMatchObject({ id: 'stuck-new', ok: false, errorCode: 'chrome_call_timeout' });
+      expect((await result).error).toContain('chrome.tabs.create did not return within 30s');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears the owned-container single-flight after a chrome.windows.create timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      const { chrome } = createChromeMock();
+      chrome.windows.create = vi.fn(() => new Promise<never>(() => {}));
+      vi.stubGlobal('chrome', chrome);
+
+      const mod = await import('./background');
+
+      const stuck = mod.__test__.handleCommand({
+        id: 'stuck-container',
+        action: 'tabs',
+        op: 'new',
+        url: 'https://stuck.example/',
+        session: 'recover',
+        surface: 'adapter',
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(await stuck).toMatchObject({ ok: false, errorCode: 'chrome_call_timeout' });
+
+      // The single-flight must be free again, or every later command hangs behind
+      // it and the daemon reports command_result_unknown instead.
+      chrome.windows.create = vi.fn(async ({ url, focused, width, height, type }: any) => ({ id: 7, url, focused, width, height, type }));
+      const retry = mod.__test__.handleCommand({
+        id: 'recover-container',
+        action: 'tabs',
+        op: 'new',
+        url: 'https://recover.example/',
+        session: 'recover',
+        surface: 'adapter',
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      expect(await retry).toMatchObject({ id: 'recover-container', ok: true });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
